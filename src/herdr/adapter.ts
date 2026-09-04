@@ -234,7 +234,7 @@ function plainCliDiagnostic(value: string): string | undefined {
     }).join("");
     const diagnostic = printable.replace(/\s+/gu, " ").trim();
     if (diagnostic.length === 0) return undefined;
-    return diagnostic.length <= 2_000 ? diagnostic : `${diagnostic.slice(0, 1_999)}…`;
+    return diagnostic.length <= 2_000 ? diagnostic : `…${diagnostic.slice(-1_999)}`;
 }
 
 function assertAlias(alias: string): void {
@@ -530,10 +530,30 @@ export class HerdrAdapter {
         ];
         for (const value of options.args ?? []) assertText(value, "Pi argument");
         if (options.args?.length) args.push("--", ...options.args);
-        const { result } = await this.#run(args, {
-            ...options,
-            timeoutMs: options.timeoutMs ?? readinessTimeoutMs + 5_000,
-        });
+        let result: Readonly<Record<string, unknown>>;
+        try {
+            ({ result } = await this.#run(args, {
+                ...options,
+                timeoutMs: options.timeoutMs ?? readinessTimeoutMs + 5_000,
+            }));
+        } catch (error) {
+            const commandError = this.#asCommandError(error);
+            const paneDiagnostic = await this.#readPaneDiagnostic(owned.paneId, options);
+            if (paneDiagnostic === undefined) throw commandError;
+            throw new HerdrCommandError(
+                `${commandError.message}; child pane: ${paneDiagnostic}`,
+                commandError.invocation,
+                {
+                    ...(commandError.execution === undefined
+                        ? {}
+                        : { execution: commandError.execution }),
+                    ...(commandError.cliError === undefined
+                        ? {}
+                        : { cliError: commandError.cliError }),
+                    cause: commandError,
+                },
+            );
+        }
         owned.agentStarted = true;
         return operationResult(result);
     }
@@ -802,6 +822,26 @@ export class HerdrAdapter {
             invocation,
             lastExecution === undefined ? {} : { execution: lastExecution },
         );
+    }
+
+    async #readPaneDiagnostic(
+        paneId: string,
+        options: HerdrOperationOptions,
+    ): Promise<string | undefined> {
+        if (options.signal?.aborted) return undefined;
+        const invocation: CommandInvocation = {
+            executable: this.#executable,
+            args: ["pane", "read", paneId, "--source", "recent-unwrapped", "--lines", "80"],
+            timeoutMs: Math.min(options.timeoutMs ?? 2_000, 2_000),
+        };
+        let execution: CommandExecution;
+        try {
+            execution = await this.#runner(invocation);
+        } catch {
+            return undefined;
+        }
+        if (execution.termination !== "exited" || execution.exitCode !== 0) return undefined;
+        return plainCliDiagnostic(execution.stdout);
     }
 
     #appendUntil(args: string[], statuses: readonly HerdrAgentStatus[] | undefined): void {

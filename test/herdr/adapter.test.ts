@@ -278,6 +278,35 @@ describe("surface lifecycle", () => {
         fake.expectExhausted();
     });
 
+    test("includes the child pane diagnostic when Pi startup fails", async () => {
+        const fake = new FakeRunner(
+            execution({ tab: { tab_id: "w1:t1" }, root_pane: { pane_id: "w1:p1" } }),
+            failure("agent_start_timeout", "timed out waiting for agent startup"),
+            {
+                exitCode: 0,
+                stdout: 'Error: Tool "agent_mail_send" conflicts with another extension\n',
+                stderr: "",
+                termination: "exited",
+            },
+        );
+        const { adapter: instance, surface } = await createSurface(fake);
+
+        await assert.rejects(
+            instance.startPi(surface),
+            /Tool "agent_mail_send" conflicts with another extension/u,
+        );
+        assert.deepEqual(fake.calls.at(-1)?.args, [
+            "pane",
+            "read",
+            "w1:p1",
+            "--source",
+            "recent-unwrapped",
+            "--lines",
+            "80",
+        ]);
+        fake.expectExhausted();
+    });
+
     test("rejects malformed success and preserves structured CLI errors", async () => {
         const malformed = new FakeRunner({
             exitCode: 0,
