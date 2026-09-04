@@ -58,6 +58,8 @@ export interface HerdrAdapterOptions {
     readonly environment?: Readonly<Record<string, string | undefined>>;
     readonly defaultTimeoutMs?: number;
     readonly startupTimeoutMs?: number;
+    /** Poll interval used while a newly created pane finishes shell initialization. */
+    readonly shellPollIntervalMs?: number;
 }
 
 export interface HerdrOperationOptions {
@@ -118,6 +120,8 @@ interface JsonEnvelope {
 
 const VALID_STATUSES = new Set<HerdrAgentStatus>(["idle", "working", "blocked", "done", "unknown"]);
 const ENV_KEY_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
+const SHELL_STABLE_SAMPLES = 3;
+const MAX_SHELL_READINESS_MS = 10_000;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
     return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -176,6 +180,24 @@ function operationResult(result: Readonly<Record<string, unknown>>): HerdrOperat
     return status ? { raw: result, status } : { raw: result };
 }
 
+function isAvailableShell(result: Readonly<Record<string, unknown>>): boolean {
+    const processInfo = isRecord(result.process_info) ? result.process_info : undefined;
+    if (!processInfo) return false;
+    const shellPid = processInfo.shell_pid;
+    const foregroundGroup = processInfo.foreground_process_group_id;
+    const foreground = processInfo.foreground_processes;
+    if (
+        typeof shellPid !== "number" ||
+        typeof foregroundGroup !== "number" ||
+        !Array.isArray(foreground) ||
+        foreground.length !== 1
+    ) {
+        return false;
+    }
+    const shell = foreground[0];
+    return foregroundGroup === shellPid && isRecord(shell) && shell.pid === shellPid;
+}
+
 function parseJsonLine(value: string): unknown {
     const lines = value
         .split(/\r?\n/u)
@@ -203,6 +225,16 @@ function parseCliError(execution: CommandExecution): HerdrCliErrorBody | undefin
         };
     }
     return undefined;
+}
+
+function plainCliDiagnostic(value: string): string | undefined {
+    const printable = Array.from(value, (character) => {
+        const codePoint = character.codePointAt(0) ?? 0;
+        return codePoint <= 0x1f || codePoint === 0x7f ? " " : character;
+    }).join("");
+    const diagnostic = printable.replace(/\s+/gu, " ").trim();
+    if (diagnostic.length === 0) return undefined;
+    return diagnostic.length <= 2_000 ? diagnostic : `…${diagnostic.slice(-1_999)}`;
 }
 
 function assertAlias(alias: string): void {
@@ -236,6 +268,7 @@ export class HerdrAdapter {
     readonly #environment: Readonly<Record<string, string | undefined>>;
     readonly #defaultTimeoutMs: number;
     readonly #startupTimeoutMs: number;
+    readonly #shellPollIntervalMs: number;
     readonly #owned = new WeakSet<object>();
     readonly #ownershipIds = new Set<string>();
     readonly #ownedLocations = new Set<string>();
@@ -246,9 +279,19 @@ export class HerdrAdapter {
         this.#environment = options.environment ?? process.env;
         this.#defaultTimeoutMs = options.defaultTimeoutMs ?? 35_000;
         this.#startupTimeoutMs = options.startupTimeoutMs ?? 30_000;
+        this.#shellPollIntervalMs = options.shellPollIntervalMs ?? 100;
         assertText(this.#executable, "executable");
         assertTimeout(this.#defaultTimeoutMs, "defaultTimeoutMs");
         assertTimeout(this.#startupTimeoutMs, "startupTimeoutMs");
+        if (
+            !Number.isSafeInteger(this.#shellPollIntervalMs) ||
+            this.#shellPollIntervalMs < 1 ||
+            this.#shellPollIntervalMs > 1_000
+        ) {
+            throw new HerdrValidationError(
+                "shellPollIntervalMs must be an integer between 1 and 1000",
+            );
+        }
     }
 
     isManagedEnvironment(): boolean {
@@ -473,6 +516,7 @@ export class HerdrAdapter {
         }
         const readinessTimeoutMs = options.readinessTimeoutMs ?? this.#startupTimeoutMs;
         assertTimeout(readinessTimeoutMs, "readinessTimeoutMs");
+        await this.#waitForAvailableShell(owned, options, readinessTimeoutMs);
         const args = [
             "agent",
             "start",
@@ -486,10 +530,30 @@ export class HerdrAdapter {
         ];
         for (const value of options.args ?? []) assertText(value, "Pi argument");
         if (options.args?.length) args.push("--", ...options.args);
-        const { result } = await this.#run(args, {
-            ...options,
-            timeoutMs: options.timeoutMs ?? readinessTimeoutMs + 5_000,
-        });
+        let result: Readonly<Record<string, unknown>>;
+        try {
+            ({ result } = await this.#run(args, {
+                ...options,
+                timeoutMs: options.timeoutMs ?? readinessTimeoutMs + 5_000,
+            }));
+        } catch (error) {
+            const commandError = this.#asCommandError(error);
+            const paneDiagnostic = await this.#readPaneDiagnostic(owned.paneId, options);
+            if (paneDiagnostic === undefined) throw commandError;
+            throw new HerdrCommandError(
+                `${commandError.message}; child pane: ${paneDiagnostic}`,
+                commandError.invocation,
+                {
+                    ...(commandError.execution === undefined
+                        ? {}
+                        : { execution: commandError.execution }),
+                    ...(commandError.cliError === undefined
+                        ? {}
+                        : { cliError: commandError.cliError }),
+                    cause: commandError,
+                },
+            );
+        }
         owned.agentStarted = true;
         return operationResult(result);
     }
@@ -708,10 +772,76 @@ export class HerdrAdapter {
         if (options.wait) {
             args.push("--wait");
             this.#appendUntil(args, options.until);
+            if (options.timeoutMs !== undefined) args.push("--timeout", String(options.timeoutMs));
         }
-        if (options.timeoutMs !== undefined) args.push("--timeout", String(options.timeoutMs));
         const { result } = await this.#run(args, options);
         return operationResult(result);
+    }
+
+    async #waitForAvailableShell(
+        surface: MutableSurface,
+        options: HerdrOperationOptions,
+        readinessTimeoutMs: number,
+    ): Promise<void> {
+        const shellTimeoutMs = Math.min(readinessTimeoutMs, MAX_SHELL_READINESS_MS);
+        const deadline = Date.now() + shellTimeoutMs;
+        const args = ["pane", "process-info", "--pane", surface.paneId] as const;
+        let stableSamples = 0;
+        let lastExecution: CommandExecution | undefined;
+        let lastInvocation: CommandInvocation | undefined;
+
+        while (Date.now() < deadline) {
+            if (options.signal?.aborted) break;
+            const remainingMs = Math.max(1, deadline - Date.now());
+            // oxlint-disable-next-line no-await-in-loop -- shell readiness requires ordered samples
+            const response = await this.#run(args, {
+                timeoutMs: Math.min(options.timeoutMs ?? remainingMs, remainingMs),
+                ...(options.signal === undefined ? {} : { signal: options.signal }),
+            });
+            lastExecution = response.execution;
+            lastInvocation = response.invocation;
+            stableSamples = isAvailableShell(response.result) ? stableSamples + 1 : 0;
+            if (stableSamples >= SHELL_STABLE_SAMPLES) return;
+            if (Date.now() + this.#shellPollIntervalMs >= deadline) break;
+            // oxlint-disable-next-line no-await-in-loop -- polling must preserve a quiet interval
+            await new Promise<void>((resolve) => setTimeout(resolve, this.#shellPollIntervalMs));
+        }
+
+        const invocation: CommandInvocation =
+            lastInvocation ??
+            ({
+                executable: this.#executable,
+                args: [...args],
+                timeoutMs: shellTimeoutMs,
+                ...(options.signal === undefined ? {} : { signal: options.signal }),
+            } satisfies CommandInvocation);
+        throw new HerdrCommandError(
+            options.signal?.aborted
+                ? "Herdr shell readiness wait aborted"
+                : `Herdr pane ${surface.paneId} did not reach a stable interactive shell prompt`,
+            invocation,
+            lastExecution === undefined ? {} : { execution: lastExecution },
+        );
+    }
+
+    async #readPaneDiagnostic(
+        paneId: string,
+        options: HerdrOperationOptions,
+    ): Promise<string | undefined> {
+        if (options.signal?.aborted) return undefined;
+        const invocation: CommandInvocation = {
+            executable: this.#executable,
+            args: ["pane", "read", paneId, "--source", "recent-unwrapped", "--lines", "80"],
+            timeoutMs: Math.min(options.timeoutMs ?? 2_000, 2_000),
+        };
+        let execution: CommandExecution;
+        try {
+            execution = await this.#runner(invocation);
+        } catch {
+            return undefined;
+        }
+        if (execution.termination !== "exited" || execution.exitCode !== 0) return undefined;
+        return plainCliDiagnostic(execution.stdout);
     }
 
     #appendUntil(args: string[], statuses: readonly HerdrAgentStatus[] | undefined): void {
@@ -823,6 +953,8 @@ export class HerdrAdapter {
 
         const cliError = parseCliError(execution);
         if (execution.termination !== "exited" || execution.exitCode !== 0 || cliError) {
+            const plainDiagnostic =
+                plainCliDiagnostic(execution.stderr) ?? plainCliDiagnostic(execution.stdout);
             const reason =
                 cliError?.message ??
                 cliError?.code ??
@@ -832,6 +964,7 @@ export class HerdrAdapter {
                     ? "command output limit exceeded"
                     : undefined) ??
                 execution.error?.message ??
+                plainDiagnostic ??
                 `command exited with status ${execution.exitCode}`;
             throw new HerdrCommandError(`Herdr command failed: ${reason}`, invocation, {
                 execution,

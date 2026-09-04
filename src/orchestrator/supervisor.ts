@@ -74,6 +74,20 @@ const CHILD_PROTOCOL_TOOLS = [
 const THINKING_LEVELS = new Set(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
 const TOOL_NAME_PATTERN = /^[A-Za-z][A-Za-z0-9_-]{0,127}$/u;
 
+type AgentLifecyclePhase =
+    | "create_surface"
+    | "persist_surface"
+    | "start_pi"
+    | "persist_started_surface"
+    | "submit_initial_prompt"
+    | "mark_running"
+    | "resume_create_surface"
+    | "resume_persist_surface"
+    | "resume_pi"
+    | "resume_persist_started_surface"
+    | "submit_resume_prompt"
+    | "mark_resumed";
+
 function jsonObject(value: JsonValue): Readonly<Record<string, JsonValue>> {
     return typeof value === "object" && value !== null && !Array.isArray(value)
         ? (value as Readonly<Record<string, JsonValue>>)
@@ -152,6 +166,7 @@ export class AgentSupervisor {
         });
 
         let surface: HerdrOwnedSurface | undefined;
+        let phase: AgentLifecyclePhase = "create_surface";
         try {
             surface = await this.#herdr.createSurface({
                 alias,
@@ -168,32 +183,37 @@ export class AgentSupervisor {
                 ...(signal === undefined ? {} : { signal }),
             });
             this.#surfaces.set(agent.id, surface);
+            phase = "persist_surface";
             agent = this.#recordSurface(agent.id, surface);
 
+            phase = "start_pi";
             await this.#herdr.startPi(surface, {
                 args: childArgs,
                 readinessTimeoutMs: this.#config.launchTimeoutMs,
                 timeoutMs: this.#config.launchTimeoutMs + 5_000,
                 ...(signal === undefined ? {} : { signal }),
             });
+            phase = "persist_started_surface";
             agent = this.#recordSurface(agent.id, surface);
+            phase = "submit_initial_prompt";
             await this.#herdr.prompt(surface, instructionPrompt(request.prompt), {
                 timeoutMs: this.#config.operationTimeoutMs,
                 ...(signal === undefined ? {} : { signal }),
             });
+            phase = "mark_running";
             agent = this.#transitionIfPossible(agent.id, "running");
             return { agent, sessionId };
         } catch (cause) {
             const orphaned =
                 surface === undefined ? false : !(await this.#closeAfterFailure(surface));
             this.#surfaces.delete(agent.id);
-            agent = this.#markLaunchFailure(agent.id, cause, orphaned);
+            agent = this.#markLaunchFailure(agent.id, cause, orphaned, phase);
             throw new OrchestratorError(
                 "EXTERNAL_OPERATION_FAILED",
-                `Failed to launch agent ${alias}: ${errorMessage(cause)}`,
+                `Failed to launch agent ${alias} during ${phase}: ${errorMessage(cause)}`,
                 {
                     cause,
-                    details: { agentId: agent.id, alias, status: agent.status, orphaned },
+                    details: { agentId: agent.id, alias, status: agent.status, orphaned, phase },
                     retryable: true,
                 },
             );
@@ -353,6 +373,7 @@ export class AgentSupervisor {
         const sessionFile = this.#validateSession(current, oldSurface.cwd);
         let agent = this.#transitionIfPossible(current.id, "starting");
         let surface: HerdrOwnedSurface | undefined;
+        let phase: AgentLifecyclePhase = "resume_create_surface";
         try {
             surface = await this.#herdr.createSurface({
                 alias: agent.alias,
@@ -369,7 +390,9 @@ export class AgentSupervisor {
                 ...(signal === undefined ? {} : { signal }),
             });
             this.#surfaces.set(agent.id, surface);
+            phase = "resume_persist_surface";
             agent = this.#recordSurface(agent.id, surface);
+            phase = "resume_pi";
             await this.#herdr.startPi(surface, {
                 args: [
                     "--session",
@@ -383,6 +406,7 @@ export class AgentSupervisor {
                 timeoutMs: this.#config.launchTimeoutMs + 5_000,
                 ...(signal === undefined ? {} : { signal }),
             });
+            phase = "resume_persist_started_surface";
             agent = this.#recordSurface(agent.id, surface);
             if (request.instruction !== undefined) {
                 this.#assertContent(
@@ -390,22 +414,25 @@ export class AgentSupervisor {
                     this.#config.maxMessageBytes,
                     "instruction",
                 );
+                phase = "submit_resume_prompt";
                 await this.#herdr.prompt(surface, request.instruction, {
                     timeoutMs: this.#config.operationTimeoutMs,
                     ...(signal === undefined ? {} : { signal }),
                 });
+                phase = "mark_resumed";
                 return this.#transitionIfPossible(agent.id, "running");
             }
+            phase = "mark_resumed";
             return this.#transitionIfPossible(agent.id, "idle");
         } catch (cause) {
             const orphaned =
                 surface === undefined ? false : !(await this.#closeAfterFailure(surface));
             this.#surfaces.delete(agent.id);
-            this.#markLaunchFailure(agent.id, cause, orphaned);
+            this.#markLaunchFailure(agent.id, cause, orphaned, phase);
             throw new OrchestratorError(
                 "EXTERNAL_OPERATION_FAILED",
-                `Failed to resume agent ${current.alias}: ${errorMessage(cause)}`,
-                { cause, details: { agentId: current.id, orphaned }, retryable: true },
+                `Failed to resume agent ${current.alias} during ${phase}: ${errorMessage(cause)}`,
+                { cause, details: { agentId: current.id, orphaned, phase }, retryable: true },
             );
         }
     }
@@ -490,6 +517,7 @@ export class AgentSupervisor {
         displayName: string,
     ): string[] {
         const args = [
+            "--no-extensions",
             "--session-id",
             sessionId,
             "--session-dir",
@@ -632,10 +660,15 @@ export class AgentSupervisor {
         }
     }
 
-    #markLaunchFailure(agentId: AgentId, cause: unknown, orphaned: boolean): AgentRecord {
+    #markLaunchFailure(
+        agentId: AgentId,
+        cause: unknown,
+        orphaned: boolean,
+        phase: AgentLifecyclePhase,
+    ): AgentRecord {
         const current = this.#store.getAgent(agentId);
         const metadata = mergeMetadata(current, {
-            launchFailure: { message: errorMessage(cause), at: Date.now() },
+            launchFailure: { message: errorMessage(cause), phase, at: Date.now() },
         });
         const target: AgentStatus = orphaned ? "orphaned" : "failed";
         if (canTransitionAgent(current.status, target)) {
