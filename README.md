@@ -5,9 +5,6 @@ Durable multi-agent orchestration for [Pi](https://pi.dev) inside
 while agent identity, mailbox delivery, workflow state, leases, and recovery metadata live in
 SQLite.
 
-This is a greenfield rewrite in the repository root. The original `pi-herdr-agents` project was
-used only as a behavioral reference and is not imported at runtime.
-
 ## What this fixes
 
 - Direct child-to-child mail without routing through the parent model.
