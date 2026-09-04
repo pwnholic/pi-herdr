@@ -21,6 +21,7 @@ export interface AgentRow {
     readonly tab_id: string | null;
     readonly pane_id: string | null;
     readonly parent_agent_id: string | null;
+    readonly root_agent_id: string | null;
     readonly metadata_json: string;
     readonly created_at: number;
     readonly updated_at: number;
@@ -34,12 +35,17 @@ export interface MessageRow {
     readonly sequence: number;
     readonly id: string;
     readonly sender_agent_id: string | null;
+    readonly sender_scope: string;
+    readonly root_agent_id: string | null;
     readonly recipient_agent_id: string;
     readonly thread_id: string;
     readonly reply_to_message_id: string | null;
     readonly kind: MessageKind;
     readonly content: string;
     readonly metadata_json: string;
+    readonly delivery_mode: "steer" | "followUp";
+    readonly required: number;
+    readonly hop_count: number;
     readonly state: MessageState;
     readonly attempt_count: number;
     readonly max_attempts: number;
@@ -52,6 +58,8 @@ export interface MessageRow {
     readonly dead_letter_reason: string | null;
     readonly lease_owner: string | null;
     readonly lease_expires_at: number | null;
+    readonly idempotency_key: string | null;
+    readonly intent_hash: string | null;
     readonly created_at: number;
     readonly updated_at: number;
     readonly revision: number;
@@ -94,6 +102,7 @@ export function toAgentRecord(row: AgentRow): AgentRecord {
         ...(row.tab_id === null ? {} : { tabId: row.tab_id }),
         ...(row.pane_id === null ? {} : { paneId: row.pane_id }),
         ...(row.parent_agent_id === null ? {} : { parentAgentId: row.parent_agent_id as AgentId }),
+        rootAgentId: (row.root_agent_id ?? row.id) as AgentId,
         metadata: parseStoredJson(row.metadata_json),
         createdAt: row.created_at,
         updatedAt: row.updated_at,
@@ -107,6 +116,7 @@ export function toAgentRecord(row: AgentRow): AgentRecord {
 export function toMailboxMessage(row: MessageRow): MailboxMessage {
     return {
         id: row.id as MessageId,
+        rootAgentId: (row.root_agent_id ?? row.recipient_agent_id) as AgentId,
         ...(row.sender_agent_id === null ? {} : { senderAgentId: row.sender_agent_id as AgentId }),
         recipientAgentId: row.recipient_agent_id as AgentId,
         threadId: row.thread_id as ThreadId,
@@ -116,6 +126,9 @@ export function toMailboxMessage(row: MessageRow): MailboxMessage {
         kind: row.kind,
         content: row.content,
         metadata: parseStoredJson(row.metadata_json),
+        deliveryMode: row.delivery_mode,
+        required: row.required === 1,
+        hopCount: row.hop_count,
         state: row.state,
         attemptCount: row.attempt_count,
         maxAttempts: row.max_attempts,

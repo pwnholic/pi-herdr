@@ -9,6 +9,7 @@ import {
     canTransitionAgent,
 } from "../domain/agent.ts";
 import { ValidationError } from "../domain/errors.ts";
+import type { Failpoint } from "../faults.ts";
 import { type AgentId, parseAgentId } from "../domain/ids.ts";
 import type { EnqueueResult } from "../domain/mailbox.ts";
 import { type JsonValue, validateAlias, validateLabel } from "../domain/validation.ts";
@@ -53,6 +54,7 @@ export interface SupervisorOptions {
     readonly extensionPath: string;
     readonly lifecycleExtensionPath?: string;
     readonly workspaceId?: string;
+    readonly failpoint?: Failpoint;
 }
 
 const LIVE_STATUSES = new Set<AgentStatus>([
@@ -71,9 +73,19 @@ const CHILD_PROTOCOL_TOOLS = [
     "agent_mail_send",
     "agent_mail_list",
     "agent_mail_ack",
+    "agent_mail_sent",
+    "agent_mail_retry",
+    "agent_directory",
 ] as const;
 const THINKING_LEVELS = new Set(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
 const TOOL_NAME_PATTERN = /^[A-Za-z][A-Za-z0-9_-]{0,127}$/u;
+const CONTROL_RECIPIENT_STATUSES = new Set<AgentStatus>([
+    "starting",
+    "running",
+    "idle",
+    "blocked",
+    "interrupted",
+]);
 
 type AgentLifecyclePhase =
     | "create_surface"
@@ -125,10 +137,12 @@ export class AgentSupervisor {
     readonly #herdr: HerdrControl;
     readonly #config: OrchestratorConfig;
     readonly #parentAgentId: AgentId;
+    readonly #rootAgentId: AgentId;
     readonly #sessionDir: string;
     readonly #extensionPath: string;
     readonly #lifecycleExtensionPath: string | undefined;
     readonly #workspaceId: string | undefined;
+    readonly #failpoint: Failpoint | undefined;
     readonly #surfaces = new Map<AgentId, HerdrOwnedSurface>();
 
     constructor(options: SupervisorOptions) {
@@ -136,10 +150,12 @@ export class AgentSupervisor {
         this.#herdr = options.herdr;
         this.#config = options.config;
         this.#parentAgentId = options.parentAgentId;
+        this.#rootAgentId = options.store.getAgent(options.parentAgentId).rootAgentId;
         this.#sessionDir = options.sessionDir;
         this.#extensionPath = options.extensionPath;
         this.#lifecycleExtensionPath = options.lifecycleExtensionPath;
         this.#workspaceId = options.workspaceId;
+        this.#failpoint = options.failpoint;
     }
 
     async spawn(request: SpawnAgentRequest, signal?: AbortSignal): Promise<SpawnAgentResult> {
@@ -226,6 +242,14 @@ export class AgentSupervisor {
     send(request: SendAgentMessageRequest): EnqueueResult {
         this.#assertContent(request.content, this.#config.maxMessageBytes, "content");
         const recipient = this.resolveAgent(request.recipient);
+        if (request.kind === "control" && !CONTROL_RECIPIENT_STATUSES.has(recipient.status)) {
+            throw new ValidationError(
+                `Cannot deliver control mail to ${recipient.alias} in ${recipient.status} state`,
+            );
+        }
+        if (recipient.status === "completed" || recipient.status === "failed") {
+            throw new ValidationError(`Cannot send mail to terminal agent ${recipient.alias}`);
+        }
         return this.#store.enqueueMessage({
             ...(request.senderAgentId === undefined
                 ? { senderAgentId: this.#parentAgentId }
@@ -240,7 +264,7 @@ export class AgentSupervisor {
             ...(request.replyToMessageId === undefined
                 ? {}
                 : { replyToMessageId: request.replyToMessageId }),
-            expiresAt: Date.now() + this.#config.messageTtlMs,
+            ttlMs: this.#config.messageTtlMs,
         });
     }
 
@@ -283,37 +307,63 @@ export class AgentSupervisor {
             timeoutMs: this.#config.operationTimeoutMs,
             ...(signal === undefined ? {} : { signal }),
         });
+        let registryRenamed: AgentRecord | undefined;
         try {
             const latest = this.#store.getAgent(current.id);
-            const renamed = this.#store.renameAgent({
+            registryRenamed = this.#store.renameAgent({
                 agentId: latest.id,
                 alias,
                 displayName,
                 expectedRevision: latest.revision,
             });
             this.send({
-                recipient: renamed.id,
+                recipient: registryRenamed.id,
                 kind: "control",
                 content: `Your durable display name is now ${displayName}.`,
                 metadata: { action: "rename", displayName },
-                idempotencyKey: `rename:${renamed.id}:${renamed.revision}`,
+                idempotencyKey: `rename:${registryRenamed.id}:${registryRenamed.revision}`,
             });
-            return renamed;
+            return registryRenamed;
         } catch (cause) {
+            let registryRollbackError: unknown;
+            if (registryRenamed !== undefined) {
+                try {
+                    const latest = this.#store.getAgent(current.id);
+                    this.#store.renameAgent({
+                        agentId: latest.id,
+                        alias: current.alias,
+                        displayName: current.displayName,
+                        expectedRevision: latest.revision,
+                    });
+                } catch (rollbackCause) {
+                    registryRollbackError = rollbackCause;
+                }
+            }
+            let externalRollbackError: unknown;
             try {
                 await this.#herdr.rename(surface, current.alias, current.displayName, {
                     timeoutMs: this.#config.operationTimeoutMs,
                 });
             } catch (rollbackCause) {
+                externalRollbackError = rollbackCause;
+            }
+            if (registryRollbackError !== undefined || externalRollbackError !== undefined) {
                 throw new OrchestratorError(
                     "EXTERNAL_OPERATION_FAILED",
-                    "Registry rename failed and external rename rollback also failed",
+                    "Rename failed and one or more rollback projections also failed",
                     {
                         cause,
                         details: {
                             agentId: current.id,
-                            registryError: errorMessage(cause),
-                            rollbackError: errorMessage(rollbackCause),
+                            originalError: errorMessage(cause),
+                            registryRollbackError:
+                                registryRollbackError === undefined
+                                    ? null
+                                    : errorMessage(registryRollbackError),
+                            externalRollbackError:
+                                externalRollbackError === undefined
+                                    ? null
+                                    : errorMessage(externalRollbackError),
                         },
                     },
                 );
@@ -327,10 +377,12 @@ export class AgentSupervisor {
         const stopping = this.#transitionIfPossible(current.id, "stopping");
         try {
             const surface = await this.#surfaceFor(stopping);
+            this.#failpoint?.("herdr.close.before", { agentId: stopping.id });
             await this.#herdr.close(surface, {
                 timeoutMs: this.#config.operationTimeoutMs,
                 ...(signal === undefined ? {} : { signal }),
             });
+            this.#failpoint?.("herdr.close.after", { agentId: stopping.id });
             this.#surfaces.delete(stopping.id);
             return this.#transitionIfPossible(stopping.id, "stopped");
         } catch (cause) {
@@ -496,19 +548,30 @@ export class AgentSupervisor {
     }
 
     resolveAgent(identifier: AgentId | string): AgentRecord {
-        if (UUID_PATTERN.test(identifier)) return this.#store.getAgent(parseAgentId(identifier));
-        return this.#store.getAgentByAlias(validateAlias(identifier));
+        const agent = UUID_PATTERN.test(identifier)
+            ? this.#store.getAgent(parseAgentId(identifier))
+            : this.#store.getAgentByAlias(validateAlias(identifier), this.#rootAgentId);
+        if (agent.rootAgentId !== this.#rootAgentId) {
+            throw new ValidationError("Agent is outside this coordinator ownership namespace");
+        }
+        return agent;
     }
 
     async finalizeCompletedAgent(agentId: AgentId): Promise<void> {
         const agent = this.#store.getAgent(agentId);
         if (agent.status !== "completed" && agent.status !== "failed") return;
+        const surface = this.#surfaces.get(agentId) ?? (await this.#surfaceFor(agent));
+        this.#failpoint?.("herdr.close.before", { agentId });
         try {
-            const surface = this.#surfaces.get(agentId) ?? (await this.#surfaceFor(agent));
             await this.#herdr.close(surface, { timeoutMs: this.#config.operationTimeoutMs });
+            this.#failpoint?.("herdr.close.after", { agentId });
             this.#surfaces.delete(agentId);
-        } catch {
-            // Completion is durable; recovery will reconcile a surviving external surface.
+        } catch (cause) {
+            throw new OrchestratorError(
+                "EXTERNAL_OPERATION_FAILED",
+                `Completion is durable but the Herdr surface for ${agent.alias} could not be closed`,
+                { cause, details: { agentId }, retryable: true },
+            );
         }
     }
 
@@ -571,6 +634,7 @@ export class AgentSupervisor {
         let cursor: string | undefined;
         do {
             const page = this.#store.listAgents({
+                rootAgentId: this.#rootAgentId,
                 limit: this.#config.maxPageSize,
                 ...(cursor === undefined ? {} : { cursor }),
             });

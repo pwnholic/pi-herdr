@@ -11,6 +11,9 @@ export interface OrchestratorConfig {
     readonly leaseDurationMs: number;
     readonly messageTtlMs: number;
     readonly completionPollMs: number;
+    readonly maxDeliveryBytes: number;
+    readonly mailboxRetentionMs: number;
+    readonly idempotencyRetentionMs: number;
 }
 
 export interface ConfigContext {
@@ -29,6 +32,9 @@ const DEFAULTS = {
     leaseDurationMs: 60_000,
     messageTtlMs: 7 * 24 * 60 * 60 * 1000,
     completionPollMs: 500,
+    maxDeliveryBytes: 512 * 1024,
+    mailboxRetentionMs: 30 * 24 * 60 * 60 * 1000,
+    idempotencyRetentionMs: 90 * 24 * 60 * 60 * 1000,
 } as const;
 
 function integer(
@@ -109,6 +115,27 @@ export function resolveConfig(context: ConfigContext): OrchestratorConfig {
             DEFAULTS.completionPollMs,
             100,
             60_000,
+        ),
+        maxDeliveryBytes: integer(
+            env,
+            "PI_HERDR_MAX_DELIVERY_BYTES",
+            DEFAULTS.maxDeliveryBytes,
+            1_024,
+            4 * 1024 * 1024,
+        ),
+        mailboxRetentionMs: integer(
+            env,
+            "PI_HERDR_MAILBOX_RETENTION_MS",
+            DEFAULTS.mailboxRetentionMs,
+            60_000,
+            365 * 24 * 60 * 60 * 1000,
+        ),
+        idempotencyRetentionMs: integer(
+            env,
+            "PI_HERDR_IDEMPOTENCY_RETENTION_MS",
+            DEFAULTS.idempotencyRetentionMs,
+            60_000,
+            365 * 24 * 60 * 60 * 1000,
         ),
     };
 }

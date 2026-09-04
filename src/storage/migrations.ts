@@ -10,11 +10,11 @@ interface Migration {
 const MIGRATIONS: readonly Migration[] = [
     {
         version: 1,
-        name: "durable-agent-registry-and-mailbox",
+        name: "pi-herdr-control-plane-v1",
         sql: `
       CREATE TABLE agents (
         id TEXT PRIMARY KEY,
-        alias TEXT NOT NULL UNIQUE,
+        alias TEXT NOT NULL,
         display_name TEXT NOT NULL,
         role TEXT NOT NULL,
         status TEXT NOT NULL CHECK (status IN ('registered','starting','running','idle','blocked','interrupted','stopping','stopped','completed','failed','orphaned')),
@@ -24,6 +24,7 @@ const MIGRATIONS: readonly Migration[] = [
         tab_id TEXT,
         pane_id TEXT,
         parent_agent_id TEXT REFERENCES agents(id) ON UPDATE RESTRICT ON DELETE RESTRICT,
+        root_agent_id TEXT NOT NULL REFERENCES agents(id) ON UPDATE RESTRICT ON DELETE RESTRICT,
         metadata_json TEXT NOT NULL,
         created_at INTEGER NOT NULL,
         updated_at INTEGER NOT NULL,
@@ -39,6 +40,8 @@ const MIGRATIONS: readonly Migration[] = [
 
       CREATE INDEX agents_status_created_idx ON agents(status, created_at, id);
       CREATE INDEX agents_lease_expiry_idx ON agents(lease_expires_at) WHERE lease_expires_at IS NOT NULL;
+      CREATE UNIQUE INDEX agents_root_alias_idx ON agents(root_agent_id, alias);
+      CREATE INDEX agents_root_created_idx ON agents(root_agent_id, created_at, id);
 
       CREATE TABLE mailbox_messages (
         sequence INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -46,11 +49,15 @@ const MIGRATIONS: readonly Migration[] = [
         sender_agent_id TEXT REFERENCES agents(id) ON UPDATE RESTRICT ON DELETE RESTRICT,
         sender_scope TEXT NOT NULL,
         recipient_agent_id TEXT NOT NULL REFERENCES agents(id) ON UPDATE RESTRICT ON DELETE RESTRICT,
+        root_agent_id TEXT NOT NULL REFERENCES agents(id) ON UPDATE RESTRICT ON DELETE RESTRICT,
         thread_id TEXT NOT NULL,
         reply_to_message_id TEXT REFERENCES mailbox_messages(id) ON UPDATE RESTRICT ON DELETE RESTRICT,
         kind TEXT NOT NULL CHECK (kind IN ('message','request','response','control','result','event')),
         content TEXT NOT NULL,
         metadata_json TEXT NOT NULL,
+        delivery_mode TEXT NOT NULL CHECK (delivery_mode IN ('steer','followUp')),
+        required INTEGER NOT NULL CHECK (required IN (0,1)),
+        hop_count INTEGER NOT NULL DEFAULT 0 CHECK (hop_count BETWEEN 0 AND 64),
         state TEXT NOT NULL CHECK (state IN ('queued','delivered','read','acked','dead_letter')),
         attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
         max_attempts INTEGER NOT NULL CHECK (max_attempts BETWEEN 1 AND 100),
@@ -90,6 +97,39 @@ const MIGRATIONS: readonly Migration[] = [
       CREATE INDEX mailbox_lease_expiry_idx
         ON mailbox_messages(lease_expires_at)
         WHERE lease_expires_at IS NOT NULL;
+      CREATE INDEX mailbox_root_state_idx ON mailbox_messages(root_agent_id, state, sequence);
+
+      CREATE TABLE mailbox_idempotency_tombstones (
+        sender_scope TEXT NOT NULL,
+        idempotency_key TEXT NOT NULL,
+        intent_hash TEXT NOT NULL,
+        message_id TEXT NOT NULL,
+        retained_until INTEGER NOT NULL,
+        created_at INTEGER NOT NULL,
+        PRIMARY KEY (sender_scope, idempotency_key)
+      ) STRICT;
+      CREATE INDEX mailbox_tombstones_expiry_idx
+        ON mailbox_idempotency_tombstones(retained_until);
+
+      CREATE TABLE completion_outbox (
+        agent_id TEXT PRIMARY KEY REFERENCES agents(id) ON UPDATE RESTRICT ON DELETE RESTRICT,
+        invocation_token TEXT NOT NULL,
+        payload_json TEXT NOT NULL,
+        state TEXT NOT NULL CHECK (state IN ('declared','emitted','parent_applied','acknowledged','invalidated')),
+        message_id TEXT REFERENCES mailbox_messages(id) ON UPDATE RESTRICT ON DELETE RESTRICT,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        revision INTEGER NOT NULL DEFAULT 0 CHECK (revision >= 0)
+      ) STRICT;
+
+      CREATE TABLE mailbox_effects (
+        message_id TEXT PRIMARY KEY REFERENCES mailbox_messages(id) ON UPDATE RESTRICT ON DELETE RESTRICT,
+        effect TEXT NOT NULL,
+        state TEXT NOT NULL CHECK (state IN ('applying','applied','notified')),
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        revision INTEGER NOT NULL DEFAULT 0 CHECK (revision >= 0)
+      ) STRICT;
 
       CREATE TABLE workflows (
         id TEXT PRIMARY KEY,
@@ -173,18 +213,26 @@ export function migrate(connection: Database.Database, now: number): void {
             }
         }
 
-        const applyPending = connection.transaction(() => {
-            for (const migration of MIGRATIONS) {
-                if (migration.version <= latestApplied) continue;
-                connection.exec(migration.sql);
-                connection
-                    .prepare(
-                        "INSERT INTO schema_migrations(version, name, applied_at) VALUES (?, ?, ?)",
-                    )
-                    .run(migration.version, migration.name, now);
+        for (const migration of MIGRATIONS) {
+            if (migration.version <= latestApplied) continue;
+            connection
+                .transaction(() => {
+                    connection.exec(migration.sql);
+                    connection
+                        .prepare(
+                            "INSERT INTO schema_migrations(version, name, applied_at) VALUES (?, ?, ?)",
+                        )
+                        .run(migration.version, migration.name, now);
+                })
+                .immediate();
+            const violations = connection.pragma("foreign_key_check") as unknown[];
+            const violation = violations.at(0);
+            if (violation !== undefined) {
+                throw new MigrationError(
+                    `Foreign-key violation after migration ${migration.version}`,
+                );
             }
-        });
-        applyPending.immediate();
+        }
     } catch (cause) {
         if (cause instanceof MigrationError) throw cause;
         throw new MigrationError("Failed to migrate control-plane database", cause);

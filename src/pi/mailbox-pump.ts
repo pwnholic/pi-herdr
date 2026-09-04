@@ -24,6 +24,7 @@ export interface MailboxPumpStore {
     retryMessage(
         input: Parameters<SqliteControlPlaneStore["retryMessage"]>[0],
     ): ReturnType<SqliteControlPlaneStore["retryMessage"]>;
+    pruneMailbox?: SqliteControlPlaneStore["pruneMailbox"];
 }
 
 export interface MailboxPumpOptions {
@@ -36,6 +37,13 @@ export interface MailboxPumpOptions {
     readonly owner?: string;
     readonly now?: () => number;
     readonly onError?: (error: unknown) => void;
+    readonly onAcknowledged?: (
+        original: MailboxMessage,
+        acknowledged: MailboxMessage,
+    ) => Promise<void> | void;
+    readonly maxDeliveryBytes?: number;
+    readonly retentionMs?: number;
+    readonly idempotencyRetentionMs?: number;
 }
 
 /**
@@ -52,11 +60,18 @@ export class MailboxPump {
     readonly #dispatch: (message: MailboxMessage) => Promise<MailboxDisposition>;
     readonly #now: () => number;
     readonly #onError: (error: unknown) => void;
+    readonly #onAcknowledged:
+        | ((original: MailboxMessage, acknowledged: MailboxMessage) => Promise<void> | void)
+        | undefined;
+    readonly #maxDeliveryBytes: number;
+    readonly #retentionMs: number | undefined;
+    readonly #idempotencyRetentionMs: number | undefined;
     readonly owner: string;
     #timer: NodeJS.Timeout | undefined;
     #inFlight: Promise<void> | undefined;
     readonly #readLeases = new Set<MessageId>();
     #stopped = true;
+    #lastPruneAt: number | undefined;
 
     constructor(options: MailboxPumpOptions) {
         this.#store = options.store;
@@ -70,6 +85,10 @@ export class MailboxPump {
         this.#dispatch = options.dispatch;
         this.#now = options.now ?? Date.now;
         this.#onError = options.onError ?? (() => undefined);
+        this.#onAcknowledged = options.onAcknowledged;
+        this.#maxDeliveryBytes = options.maxDeliveryBytes ?? Number.POSITIVE_INFINITY;
+        this.#retentionMs = options.retentionMs;
+        this.#idempotencyRetentionMs = options.idempotencyRetentionMs;
         this.owner = options.owner ?? `pi:${process.pid}:${randomUUID()}`;
     }
 
@@ -97,6 +116,15 @@ export class MailboxPump {
         return operation;
     }
 
+    async pollMessage(messageId: MessageId): Promise<void> {
+        if (this.#inFlight !== undefined) await this.#inFlight;
+        const operation = this.#poll(messageId).finally(() => {
+            if (this.#inFlight === operation) this.#inFlight = undefined;
+        });
+        this.#inFlight = operation;
+        return operation;
+    }
+
     #schedule(delay: number): void {
         if (this.#stopped) return;
         this.#timer = setTimeout(() => {
@@ -108,33 +136,62 @@ export class MailboxPump {
         this.#timer.unref();
     }
 
-    async #poll(): Promise<void> {
+    async #poll(messageId?: MessageId): Promise<void> {
         this.#renewReadLeases();
-        const messages = this.#store.claimMessages({
-            recipientAgentId: this.#recipientAgentId,
-            owner: this.owner,
-            leaseMs: this.#leaseMs,
-            limit: this.#batchSize,
-        });
-        for (const message of messages) {
-            // Mailbox sequence is causal: later messages must not overtake earlier ones.
+        this.#pruneIfDue();
+        const maximum = messageId === undefined ? this.#batchSize : 1;
+        let deliveredBytes = 0;
+        for (let index = 0; index < maximum; index += 1) {
+            const [message] = this.#store.claimMessages({
+                recipientAgentId: this.#recipientAgentId,
+                owner: this.owner,
+                leaseMs: this.#leaseMs,
+                limit: 1,
+                ...(messageId === undefined ? {} : { messageId }),
+            });
+            if (message === undefined) return;
+            // Claim immediately before dispatch so a slow earlier delivery cannot expire
+            // leases for payloads that have not been presented to Pi yet.
             // eslint-disable-next-line no-await-in-loop
-            await this.#deliver(message);
+            if (!(await this.#deliver(message))) return;
+            deliveredBytes += Buffer.byteLength(message.content, "utf8");
+            if (deliveredBytes >= this.#maxDeliveryBytes) break;
         }
     }
 
-    async #deliver(message: MailboxMessage): Promise<void> {
+    async #deliver(message: MailboxMessage): Promise<boolean> {
         let latest = message;
+        let heartbeatError: unknown;
+        let acknowledged: MailboxMessage | undefined;
+        const heartbeat = setInterval(
+            () => {
+                if (heartbeatError !== undefined) return;
+                try {
+                    latest = this.#store.renewMessageLease({
+                        messageId: latest.id,
+                        recipientAgentId: this.#recipientAgentId,
+                        owner: this.owner,
+                        expectedRevision: latest.revision,
+                        leaseMs: this.#leaseMs,
+                    });
+                } catch (error) {
+                    heartbeatError = error;
+                }
+            },
+            Math.max(10, Math.floor(this.#leaseMs / 3)),
+        );
+        heartbeat.unref();
         try {
             const disposition = await this.#dispatch(message);
+            if (heartbeatError !== undefined) throw heartbeatError;
             latest = this.#store.markMessageRead({
-                messageId: message.id,
+                messageId: latest.id,
                 recipientAgentId: this.#recipientAgentId,
                 owner: this.owner,
-                expectedRevision: message.revision,
+                expectedRevision: latest.revision,
             });
             if (disposition === "ack") {
-                this.#store.acknowledgeMessage({
+                acknowledged = this.#store.acknowledgeMessage({
                     messageId: latest.id,
                     recipientAgentId: this.#recipientAgentId,
                     owner: this.owner,
@@ -157,7 +214,18 @@ export class MailboxPump {
                 this.#onError(retryError);
             }
             this.#onError(error);
+            return false;
+        } finally {
+            clearInterval(heartbeat);
         }
+        if (acknowledged !== undefined && this.#onAcknowledged !== undefined) {
+            try {
+                await this.#onAcknowledged(message, acknowledged);
+            } catch (error) {
+                this.#onError(error);
+            }
+        }
+        return true;
     }
 
     #renewReadLeases(): void {
@@ -183,6 +251,25 @@ export class MailboxPump {
                 leaseMs: this.#leaseMs,
             });
         }
+    }
+
+    #pruneIfDue(): void {
+        if (
+            this.#store.pruneMailbox === undefined ||
+            this.#retentionMs === undefined ||
+            this.#idempotencyRetentionMs === undefined
+        ) {
+            return;
+        }
+        const now = this.#now();
+        const interval = Math.min(this.#retentionMs, 60 * 60 * 1000);
+        if (this.#lastPruneAt !== undefined && now - this.#lastPruneAt < interval) return;
+        this.#store.pruneMailbox({
+            retentionMs: this.#retentionMs,
+            idempotencyRetentionMs: this.#idempotencyRetentionMs,
+            limit: this.#batchSize,
+        });
+        this.#lastPruneAt = now;
     }
 }
 

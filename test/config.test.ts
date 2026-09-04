@@ -7,6 +7,8 @@ describe("resolveConfig", () => {
         const config = resolveConfig({ sessionDir: "/sessions/project", cwd: "/repo", env: {} });
         assert.equal(config.databasePath, "/sessions/project/pi-herdr/control.sqlite");
         assert.equal(config.maxLiveAgents, 8);
+        assert.equal(config.maxDeliveryBytes, 512 * 1024);
+        assert.equal(config.mailboxRetentionMs, 30 * 24 * 60 * 60 * 1000);
     });
 
     test("resolves a relative explicit database path against the child cwd", () => {
@@ -27,6 +29,15 @@ describe("resolveConfig", () => {
                     env: { PI_HERDR_MAX_AGENTS: "0" },
                 }),
             /PI_HERDR_MAX_AGENTS must be between 1 and 64/,
+        );
+        assert.throws(
+            () =>
+                resolveConfig({
+                    sessionDir: "/sessions/project",
+                    cwd: "/repo",
+                    env: { PI_HERDR_MAILBOX_RETENTION_MS: "100" },
+                }),
+            /PI_HERDR_MAILBOX_RETENTION_MS must be between/,
         );
     });
 });

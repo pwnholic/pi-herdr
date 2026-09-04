@@ -8,13 +8,14 @@ SQLite.
 ## What this fixes
 
 - Direct child-to-child mail without routing through the parent model.
-- Durable at-least-once delivery with idempotency keys, acknowledgements, retries, TTL, and a
-  dead-letter state.
+- Durable at-least-once delivery with stable idempotency keys, acknowledgements, strict recipient
+  FIFO, active lease heartbeats, retries, TTL, dead letters, and sender-visible receipts.
+- Coordinator namespaces with storage-enforced provenance and lifecycle/control authorization.
 - Corrective steering after Escape without killing or manually resuming the child process.
 - Mutable Herdr agent aliases with coordinated agent, pane, tab, registry, and Pi display names.
 - Restart recovery using immutable agent IDs and verified Herdr workspace/tab/pane capabilities.
-- Explicit completion: `agent_end` is never treated as final, and `agent_settled` completes work
-  only after the child calls `agent_complete`.
+- Explicit crash-safe completion: `agent_end` is never treated as final, and a durable
+  `declared → emitted → parent_applied → acknowledged` outbox survives child or parent restart.
 - Persistent DAG workflows with bounded concurrency, dependency scheduling, cancellation, and
   crash-safe spawn reservations.
 
@@ -28,7 +29,7 @@ Pi parent extension
                 │
                 ▼
         SQLite control plane (WAL)
-      registry · leases · mail · DAGs
+ registry · leases · mail · effects · DAGs
                 ▲
        ┌────────┼────────┐
        │        │        │
@@ -39,7 +40,8 @@ Pi parent extension
 ```
 
 Mailbox payloads have exactly one live-delivery path: the recipient extension injects them through
-Pi using `deliverAs: "steer"`. Herdr controls the terminal/process lifecycle, so a correction is not
+Pi. Authorized parent control uses `deliverAs: "steer"`; ordinary messages, requests, responses,
+and events use `followUp`. Herdr controls only the terminal/process lifecycle, so payloads are not
 duplicated through terminal input.
 
 ## Requirements
@@ -73,12 +75,14 @@ managed Herdr pane.
 Every process receives the durable mailbox tools:
 
 - `agent_mail_send`, `agent_mail_list`, `agent_mail_read`, `agent_mail_ack`
+- `agent_mail_sent`, `agent_mail_retry`, `agent_directory`
 - `agent_complete` for an explicitly assigned child
 
 The parent coordinator additionally receives lifecycle tools:
 
 - `agent_spawn`, `agent_steer`, `agent_interrupt`, `agent_resume`
 - `agent_rename`, `agent_stop`, `agents_list`
+- `agent_mail_dead_letters`, `agent_mail_status`
 - `workflow_start`, `workflow_status`, `workflow_list`, `workflow_cancel`
 
 Important behavior:
@@ -87,6 +91,10 @@ Important behavior:
 - `agent_steer` writes a durable correction; the child mailbox pump injects it into the current or
   next Pi turn.
 - `agent_rename` changes the mutable alias. Routing by immutable UUID remains stable.
+- Successful direct mail reports paths such as `Interacted with /root/durable_store`; the result
+  also states whether delivery is live or deferred until explicit resume.
+- `queued`, `delivered`, `read`, `acked`, and `dead_letter` are durable delivery receipts. A sender
+  can inspect them with `agent_mail_sent`; a coordinator can inspect and retry namespace failures.
 - A normal idle/settled turn does not shut down a child. The child must call `agent_complete`, and
   the parent closes the owned Herdr tab only after processing its durable result.
 
@@ -104,9 +112,17 @@ Important behavior:
 | `PI_HERDR_LEASE_DURATION_MS` | `60000` | Agent/mail delivery lease |
 | `PI_HERDR_MESSAGE_TTL_MS` | `604800000` | Default mailbox TTL |
 | `PI_HERDR_COMPLETION_POLL_MS` | `500` | Inbox pump interval |
+| `PI_HERDR_MAX_DELIVERY_BYTES` | `524288` | Context bytes accepted per pump cycle |
+| `PI_HERDR_MAILBOX_RETENTION_MS` | `2592000000` | Terminal ordinary-mail retention |
+| `PI_HERDR_IDEMPOTENCY_RETENTION_MS` | `7776000000` | Replay tombstone retention after pruning |
 
 Child identity variables (`PI_HERDR_AGENT_ID`, `PI_HERDR_PARENT_ID`, and related fields) are set by
 the supervisor and should not be supplied manually.
+
+This rewrite intentionally has one clean schema baseline. A database created by the superseded
+pre-0.1 architecture is rejected with `MIGRATION_FAILED`; archive or explicitly remove that old
+development database before starting the rewritten extension. Pi Herdr never deletes it
+automatically.
 
 ## Development
 

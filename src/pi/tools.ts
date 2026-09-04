@@ -8,8 +8,6 @@ const MessageKindSchema = Type.Union([
     Type.Literal("message"),
     Type.Literal("request"),
     Type.Literal("response"),
-    Type.Literal("control"),
-    Type.Literal("result"),
     Type.Literal("event"),
 ]);
 
@@ -59,7 +57,11 @@ export function registerPiHerdrTools(
         executionMode: "sequential",
         async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
             const result = runtime.sendMail(params);
-            return toolResult("agent_mail_send", result, `Queued message ${result.message.id}`);
+            return toolResult(
+                "agent_mail_send",
+                result,
+                `Interacted with \`${result.recipient.path}\` — queued message ${result.message.id}`,
+            );
         },
     });
 
@@ -72,6 +74,7 @@ export function registerPiHerdrTools(
             states: Type.Optional(Type.Array(MessageStateSchema, { uniqueItems: true })),
             limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 100 })),
             cursor: Type.Optional(Type.String({ minLength: 1 })),
+            threadId: Type.Optional(Type.String({ format: "uuid" })),
         }),
         async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
             const result = runtime.listMail(params);
@@ -80,6 +83,86 @@ export function registerPiHerdrTools(
                 result,
                 `${result.items.length} mailbox message(s)`,
             );
+        },
+    });
+
+    pi.registerTool({
+        name: "agent_mail_sent",
+        label: "List sent agent mail",
+        description: "Inspect durable delivery receipts for this agent's outbox.",
+        parameters: Type.Object({
+            states: Type.Optional(Type.Array(MessageStateSchema, { uniqueItems: true })),
+            limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 100 })),
+            cursor: Type.Optional(Type.String({ minLength: 1 })),
+            threadId: Type.Optional(Type.String({ format: "uuid" })),
+        }),
+        async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
+            const result = runtime.listSentMail(params);
+            return toolResult("agent_mail_sent", result, `${result.items.length} sent message(s)`);
+        },
+    });
+
+    pi.registerTool({
+        name: "agent_mail_retry",
+        label: "Retry dead-lettered agent mail",
+        description: "Requeue one dead-lettered message owned by this sender.",
+        parameters: Type.Object({ messageId: Type.String({ format: "uuid" }) }),
+        executionMode: "sequential",
+        async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
+            const result = runtime.retryDeadLetter(params.messageId);
+            return toolResult("agent_mail_retry", result, `Requeued ${result.id}`);
+        },
+    });
+
+    if (!childProcess)
+        pi.registerTool({
+            name: "agent_mail_dead_letters",
+            label: "List dead-lettered agent mail",
+            description:
+                "Inspect failed or expired messages in the current coordinator namespace, with durable failure reasons.",
+            parameters: Type.Object({
+                limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 100 })),
+                cursor: Type.Optional(Type.String({ minLength: 1 })),
+            }),
+            async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
+                const result = runtime.listDeadLetters(params);
+                return toolResult(
+                    "agent_mail_dead_letters",
+                    result,
+                    `${result.items.length} dead-lettered message(s)`,
+                );
+            },
+        });
+
+    if (!childProcess)
+        pi.registerTool({
+            name: "agent_mail_status",
+            label: "Inspect mailbox health",
+            description:
+                "Show namespace queue depth, oldest pending message, pending bytes, and dead-letter count.",
+            parameters: Type.Object({}),
+            async execute(_toolCallId, _params, _signal, _onUpdate, _ctx) {
+                const result = runtime.mailboxStatus();
+                return toolResult(
+                    "agent_mail_status",
+                    result,
+                    `${result.queued} queued message(s)`,
+                );
+            },
+        });
+
+    pi.registerTool({
+        name: "agent_directory",
+        label: "List authorized Pi Herdr peers",
+        description:
+            "List agents in this coordinator namespace with immutable IDs, aliases, roles, and states.",
+        parameters: Type.Object({
+            limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 100 })),
+            cursor: Type.Optional(Type.String({ minLength: 1 })),
+        }),
+        async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
+            const result = runtime.listPeers(params);
+            return toolResult("agent_directory", result, `${result.items.length} peer(s)`);
         },
     });
 
@@ -285,7 +368,8 @@ function registerParentTools(pi: ExtensionAPI, runtime: PiHerdrRuntime): void {
             cursor: Type.Optional(Type.String({ minLength: 1 })),
         }),
         async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
-            const result = runtime.requireParent().store.listAgents(params);
+            const { store, identity } = runtime.requireParent();
+            const result = store.listAgents({ ...params, rootAgentId: identity.rootAgentId });
             return toolResult("agents_list", result, `${result.items.length} agent(s)`);
         },
     });
