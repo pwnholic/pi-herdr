@@ -25,6 +25,7 @@ const RESULT: HerdrOperationResult = { raw: {}, status: "idle" };
 class FakeHerdr {
     readonly calls: Array<{ readonly name: string; readonly value?: unknown }> = [];
     failStart = false;
+    failPrompt = false;
     inspection: HerdrAgentInspection = { status: "idle", raw: {} };
 
     async createSurface(options: CreateHerdrSurfaceOptions): Promise<HerdrOwnedSurface> {
@@ -59,6 +60,7 @@ class FakeHerdr {
         _options?: PromptOptions,
     ): Promise<HerdrOperationResult> {
         this.calls.push({ name: "prompt", value: text });
+        if (this.failPrompt) throw new Error("prompt failed");
         return RESULT;
     }
 
@@ -262,10 +264,33 @@ describe("AgentSupervisor", () => {
             (error: unknown) =>
                 error instanceof OrchestratorError &&
                 error.code === "EXTERNAL_OPERATION_FAILED" &&
+                error.details.phase === "start_pi" &&
                 error.details.orphaned === false,
         );
         assert.equal(store.getAgentByAlias("broken").status, "failed");
         assert.equal(herdr.calls.at(-1)?.name, "close");
+    });
+
+    test("identifies failure while submitting the initial prompt", async () => {
+        herdr.failPrompt = true;
+        await assert.rejects(
+            supervisor.spawn({
+                alias: "prompt_broken",
+                role: "test",
+                prompt: "Fail after startup",
+                cwd: directory,
+            }),
+            (error: unknown) =>
+                error instanceof OrchestratorError &&
+                error.details.phase === "submit_initial_prompt" &&
+                /during submit_initial_prompt/u.test(error.message),
+        );
+        const failed = store.getAgentByAlias("prompt_broken");
+        assert.equal(failed.status, "failed");
+        assert.equal(
+            (failed.metadata as { launchFailure?: { phase?: string } }).launchFailure?.phase,
+            "submit_initial_prompt",
+        );
     });
 
     test("resumes only an identity-matching Pi session file", async () => {

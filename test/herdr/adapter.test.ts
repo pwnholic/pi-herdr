@@ -35,6 +35,7 @@ function failure(code: string, message: string): CommandExecution {
 class FakeRunner {
     readonly calls: CommandInvocation[] = [];
     readonly #responses: Array<CommandExecution | Error>;
+    busyShellChecks = 0;
 
     constructor(...responses: Array<CommandExecution | Error>) {
         this.#responses = responses;
@@ -42,6 +43,28 @@ class FakeRunner {
 
     readonly run: CommandRunner = async (invocation) => {
         this.calls.push(invocation);
+        if (invocation.args[0] === "pane" && invocation.args[1] === "process-info") {
+            if (this.busyShellChecks > 0) {
+                this.busyShellChecks -= 1;
+                return execution({
+                    process_info: {
+                        shell_pid: 100,
+                        foreground_process_group_id: 100,
+                        foreground_processes: [
+                            { pid: 100, name: "fish" },
+                            { pid: 101, name: "direnv" },
+                        ],
+                    },
+                });
+            }
+            return execution({
+                process_info: {
+                    shell_pid: 100,
+                    foreground_process_group_id: 100,
+                    foreground_processes: [{ pid: 100, name: "fish" }],
+                },
+            });
+        }
         const response = this.#responses.shift();
         if (!response) throw new Error(`Unexpected command: ${invocation.args.join(" ")}`);
         if (response instanceof Error) throw response;
@@ -62,6 +85,7 @@ function adapter(
         environment,
         defaultTimeoutMs: 10_000,
         startupTimeoutMs: 30_000,
+        shellPollIntervalMs: 1,
     });
 }
 
@@ -206,7 +230,7 @@ describe("surface lifecycle", () => {
             args: ["--model", "openai/gpt-5", "--session", "/tmp/s p.jsonl"],
         });
 
-        assert.partialDeepStrictEqual(fake.calls[1], {
+        assert.partialDeepStrictEqual(fake.calls[4], {
             args: [
                 "agent",
                 "start",
@@ -227,6 +251,30 @@ describe("surface lifecycle", () => {
         });
         assert.equal(result.status, "idle");
         assert.equal(surface.agentStarted, true);
+        fake.expectExhausted();
+    });
+
+    test("waits for a stably idle shell before starting Pi", async () => {
+        const fake = new FakeRunner(
+            execution({ tab: { tab_id: "w1:t1" }, root_pane: { pane_id: "w1:p1" } }),
+            execution({ agent: { status: "idle" } }),
+        );
+        fake.busyShellChecks = 2;
+        const { adapter: instance, surface } = await createSurface(fake);
+
+        await instance.startPi(surface);
+
+        assert.deepEqual(
+            fake.calls.slice(1).map((call) => call.args.slice(0, 2)),
+            [
+                ["pane", "process-info"],
+                ["pane", "process-info"],
+                ["pane", "process-info"],
+                ["pane", "process-info"],
+                ["pane", "process-info"],
+                ["agent", "start"],
+            ],
+        );
         fake.expectExhausted();
     });
 
@@ -313,7 +361,10 @@ describe("live agent control", () => {
         });
 
         assert.deepEqual(
-            fake.calls.slice(2).map((call) => call.args),
+            fake.calls
+                .filter((call) => call.args[1] !== "process-info")
+                .slice(2)
+                .map((call) => call.args),
             [
                 [
                     "agent",
@@ -328,7 +379,7 @@ describe("live agent control", () => {
                     "--timeout",
                     "90000",
                 ],
-                ["agent", "prompt", "reviewer", "focus on auth", "--timeout", "4000"],
+                ["agent", "prompt", "reviewer", "focus on auth"],
                 ["agent", "send-keys", "reviewer", "esc"],
                 [
                     "agent",
@@ -373,7 +424,25 @@ describe("live agent control", () => {
         const { adapter: instance, surface } = await createStartedSurface(fake);
 
         await assert.rejects(instance.wait(surface, { signal: controller.signal }), /aborted/);
-        assert.equal(fake.calls[2]?.signal, controller.signal);
+        assert.equal(fake.calls.at(-1)?.signal, controller.signal);
+    });
+
+    test("surfaces plain-text Herdr CLI diagnostics", async () => {
+        const rejected = new FakeRunner({
+            exitCode: 2,
+            stdout: "",
+            stderr: "--timeout requires --wait\n",
+            termination: "exited",
+        });
+
+        await assert.rejects(
+            adapter(rejected).createSurface({
+                alias: "builder",
+                cwd: "/repo",
+                workspaceId: "w1",
+            }),
+            /--timeout requires --wait/u,
+        );
     });
 });
 
@@ -390,7 +459,10 @@ describe("transactional rename", () => {
         await instance.rename(surface, "api_reviewer", "API Reviewer");
 
         assert.deepEqual(
-            fake.calls.slice(2).map((call) => call.args),
+            fake.calls
+                .filter((call) => call.args[1] !== "process-info")
+                .slice(2)
+                .map((call) => call.args),
             [
                 ["agent", "rename", "reviewer", "api_reviewer"],
                 ["pane", "rename", "w1:p1", "API Reviewer"],
@@ -432,7 +504,10 @@ describe("transactional rename", () => {
             });
         }
         assert.deepEqual(
-            fake.calls.slice(2).map((call) => call.args),
+            fake.calls
+                .filter((call) => call.args[1] !== "process-info")
+                .slice(2)
+                .map((call) => call.args),
             [
                 ["agent", "rename", "reviewer", "api_reviewer"],
                 ["pane", "rename", "w1:p1", "API Reviewer"],
