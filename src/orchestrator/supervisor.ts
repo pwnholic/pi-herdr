@@ -51,6 +51,7 @@ export interface SupervisorOptions {
     readonly parentAgentId: AgentId;
     readonly sessionDir: string;
     readonly extensionPath: string;
+    readonly lifecycleExtensionPath?: string;
     readonly workspaceId?: string;
 }
 
@@ -126,6 +127,7 @@ export class AgentSupervisor {
     readonly #parentAgentId: AgentId;
     readonly #sessionDir: string;
     readonly #extensionPath: string;
+    readonly #lifecycleExtensionPath: string | undefined;
     readonly #workspaceId: string | undefined;
     readonly #surfaces = new Map<AgentId, HerdrOwnedSurface>();
 
@@ -136,6 +138,7 @@ export class AgentSupervisor {
         this.#parentAgentId = options.parentAgentId;
         this.#sessionDir = options.sessionDir;
         this.#extensionPath = options.extensionPath;
+        this.#lifecycleExtensionPath = options.lifecycleExtensionPath;
         this.#workspaceId = options.workspaceId;
     }
 
@@ -395,12 +398,11 @@ export class AgentSupervisor {
             phase = "resume_pi";
             await this.#herdr.startPi(surface, {
                 args: [
+                    ...this.#isolatedExtensionArgs(),
                     "--session",
                     sessionFile,
                     "--name",
                     agent.displayName,
-                    "--extension",
-                    this.#extensionPath,
                 ],
                 readinessTimeoutMs: this.#config.launchTimeoutMs,
                 timeoutMs: this.#config.launchTimeoutMs + 5_000,
@@ -517,15 +519,13 @@ export class AgentSupervisor {
         displayName: string,
     ): string[] {
         const args = [
-            "--no-extensions",
+            ...this.#isolatedExtensionArgs(),
             "--session-id",
             sessionId,
             "--session-dir",
             sessionDir,
             "--name",
             displayName,
-            "--extension",
-            this.#extensionPath,
         ];
         if (request.model !== undefined) {
             args.push("--model", validateLabel(request.model, "model", 256));
@@ -553,6 +553,17 @@ export class AgentSupervisor {
             );
         }
         return args;
+    }
+
+    #isolatedExtensionArgs(): string[] {
+        return [
+            "--no-extensions",
+            ...(this.#lifecycleExtensionPath === undefined
+                ? []
+                : ["--extension", this.#lifecycleExtensionPath]),
+            "--extension",
+            this.#extensionPath,
+        ];
     }
 
     #assertCapacity(): void {

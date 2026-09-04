@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
-import { mkdirSync } from "node:fs";
-import { dirname } from "node:path";
+import { existsSync, mkdirSync } from "node:fs";
+import { homedir } from "node:os";
+import { dirname, join, resolve } from "node:path";
 import type {
     AgentEndEvent,
     ExtensionAPI,
@@ -19,6 +20,19 @@ import { WorkflowEngine } from "../workflow/index.ts";
 import { type MailboxDisposition, MailboxPump } from "./mailbox-pump.ts";
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
+const HERDR_PI_LIFECYCLE_EXTENSION = "herdr-agent-state.ts";
+
+function discoverHerdrLifecycleExtension(
+    environment: Readonly<Record<string, string | undefined>>,
+): string | undefined {
+    const configuredDirectory = environment.PI_CODING_AGENT_DIR?.trim();
+    const agentDirectory =
+        configuredDirectory === undefined || configuredDirectory.length === 0
+            ? join(homedir(), ".pi", "agent")
+            : resolve(configuredDirectory);
+    const candidate = join(agentDirectory, "extensions", HERDR_PI_LIFECYCLE_EXTENSION);
+    return existsSync(candidate) ? candidate : undefined;
+}
 
 export interface CompletionArtifact {
     readonly path: string;
@@ -80,6 +94,7 @@ export class PiHerdrRuntime {
     readonly #pi: ExtensionAPI;
     readonly #environment: Readonly<Record<string, string | undefined>>;
     readonly #extensionPath: string;
+    readonly #lifecycleExtensionPath: string | undefined;
     readonly #openStore: (filename: string) => SqliteControlPlaneStore;
     readonly #createHerdr: (
         environment: Readonly<Record<string, string | undefined>>,
@@ -100,6 +115,7 @@ export class PiHerdrRuntime {
         this.#pi = pi;
         this.#environment = dependencies.environment ?? process.env;
         this.#extensionPath = dependencies.extensionPath;
+        this.#lifecycleExtensionPath = discoverHerdrLifecycleExtension(this.#environment);
         this.#openStore =
             dependencies.openStore ?? ((filename) => SqliteControlPlaneStore.open({ filename }));
         this.#createHerdr =
@@ -399,6 +415,9 @@ export class PiHerdrRuntime {
             parentAgentId: identity.id,
             sessionDir: ctx.sessionManager.getSessionDir(),
             extensionPath: this.#extensionPath,
+            ...(this.#lifecycleExtensionPath === undefined
+                ? {}
+                : { lifecycleExtensionPath: this.#lifecycleExtensionPath }),
             ...(context === undefined ? {} : { workspaceId: context.workspaceId }),
         });
         await supervisor.recover();
