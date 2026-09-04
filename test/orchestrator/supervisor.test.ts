@@ -134,6 +134,7 @@ describe("AgentSupervisor", () => {
             parentAgentId: parent.id,
             sessionDir: directory,
             extensionPath: "/extension.ts",
+            lifecycleExtensionPath: "/herdr-agent-state.ts",
             workspaceId: "workspace-1",
         });
     });
@@ -161,7 +162,13 @@ describe("AgentSupervisor", () => {
             ["create", "start", "prompt"],
         );
         const start = herdr.calls[1]?.value as StartPiOptions;
-        assert.equal(start.args?.[0], "--no-extensions");
+        assert.deepEqual(start.args?.slice(0, 5), [
+            "--no-extensions",
+            "--extension",
+            "/herdr-agent-state.ts",
+            "--extension",
+            "/extension.ts",
+        ]);
         assert.ok(start.args?.includes("--session-id"));
         assert.ok(start.args?.includes("--extension"));
         assert.ok(
@@ -329,7 +336,15 @@ describe("AgentSupervisor", () => {
         assert.equal(starts.length, 2);
         const resumedStart = starts[1];
         assert.ok(resumedStart);
-        assert.ok((resumedStart.value as StartPiOptions).args?.includes(sessionFile));
+        const resumedArgs = (resumedStart.value as StartPiOptions).args;
+        assert.deepEqual(resumedArgs?.slice(0, 5), [
+            "--no-extensions",
+            "--extension",
+            "/herdr-agent-state.ts",
+            "--extension",
+            "/extension.ts",
+        ]);
+        assert.ok(resumedArgs?.includes(sessionFile));
     });
 
     test("re-adopts and closes a completed child after parent runtime replacement", async () => {

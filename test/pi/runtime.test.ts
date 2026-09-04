@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, test } from "node:test";
@@ -218,6 +218,49 @@ test("parent registration exposes workflow engine tools but not child completion
     assert.ok(names.includes("workflow_start"));
     assert.ok(names.includes("workflow_cancel"));
     assert.ok(!names.includes("agent_complete"));
+});
+
+test("passes the installed Herdr lifecycle extension to isolated children", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "pi-herdr-lifecycle-"));
+    temporaryDirectories.push(directory);
+    const extensionDirectory = join(directory, "extensions");
+    const lifecycleExtensionPath = join(extensionDirectory, "herdr-agent-state.ts");
+    mkdirSync(extensionDirectory, { recursive: true });
+    writeFileSync(lifecycleExtensionPath, "export default () => undefined;\n");
+
+    let observedLifecycleExtensionPath: string | undefined;
+    const runtime = new PiHerdrRuntime(
+        {
+            getSessionName: () => "Coordinator",
+            setSessionName: () => undefined,
+            sendMessage: () => undefined,
+        } as unknown as ExtensionAPI,
+        {
+            extensionPath: join(directory, "pi-herdr.ts"),
+            environment: {
+                PI_CODING_AGENT_DIR: directory,
+                PI_HERDR_DB: join(directory, "control.sqlite"),
+                PI_HERDR_COMPLETION_POLL_MS: "60000",
+            },
+            createHerdr: () => ({ isManagedEnvironment: () => false }) as never,
+            createSupervisor: (options) => {
+                observedLifecycleExtensionPath = options.lifecycleExtensionPath;
+                return { recover: async () => [] } as never;
+            },
+        },
+    );
+    const context = {
+        cwd: directory,
+        sessionManager: {
+            getSessionDir: () => directory,
+            getSessionId: () => "66666666-6666-4666-8666-666666666666",
+            getSessionFile: () => join(directory, "parent.jsonl"),
+        },
+    } as unknown as ExtensionContext;
+
+    await runtime.start(context);
+    assert.equal(observedLifecycleExtensionPath, lifecycleExtensionPath);
+    await runtime.stop();
 });
 
 test("parent finalizes a result before notification and automatic acknowledgement", async () => {
