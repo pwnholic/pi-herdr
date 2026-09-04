@@ -29,6 +29,7 @@ export interface AgentRecord {
     readonly tabId?: string;
     readonly paneId?: string;
     readonly parentAgentId?: AgentId;
+    readonly rootAgentId: AgentId;
     readonly metadata: JsonValue;
     readonly createdAt: number;
     readonly updatedAt: number;
@@ -49,6 +50,7 @@ export interface RegisterAgentInput {
     readonly tabId?: string;
     readonly paneId?: string;
     readonly parentAgentId?: AgentId;
+    readonly rootAgentId?: AgentId;
     readonly metadata?: JsonValue;
 }
 

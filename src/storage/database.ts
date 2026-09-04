@@ -1,5 +1,6 @@
 import Database from "better-sqlite3";
 import { StorageClosedError, ValidationError } from "../domain/errors.ts";
+import type { Failpoint } from "../faults.ts";
 import { validateNonNegativeInteger, validatePositiveInteger } from "../domain/validation.ts";
 import { migrate } from "./migrations.ts";
 
@@ -11,6 +12,7 @@ export interface OpenStoreOptions {
     readonly filename: string;
     readonly busyTimeoutMs?: number;
     readonly clock?: Clock;
+    readonly failpoint?: Failpoint;
 }
 
 const SYSTEM_CLOCK: Clock = { now: () => Date.now() };
@@ -18,6 +20,7 @@ const SYSTEM_CLOCK: Clock = { now: () => Date.now() };
 export class StorageDatabase {
     readonly #connection: Database.Database;
     readonly #clock: Clock;
+    readonly #failpoint: Failpoint | undefined;
     #closed = false;
 
     constructor(options: OpenStoreOptions) {
@@ -30,6 +33,7 @@ export class StorageDatabase {
             60_000,
         );
         this.#clock = options.clock ?? SYSTEM_CLOCK;
+        this.#failpoint = options.failpoint;
         this.#connection = new Database(options.filename);
 
         try {
@@ -58,6 +62,10 @@ export class StorageDatabase {
 
     now(): number {
         return validateNonNegativeInteger(this.#clock.now(), "clock.now()");
+    }
+
+    hit(point: string, context?: Readonly<Record<string, unknown>>): void {
+        this.#failpoint?.(point, context);
     }
 
     close(): void {

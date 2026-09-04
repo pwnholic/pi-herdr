@@ -6,6 +6,7 @@ import type {
     MailboxFilter,
     MailboxMessage,
     MessagePage,
+    OutboxFilter,
 } from "../domain/mailbox.ts";
 import type { CreateWorkflowInput, WorkflowPage, WorkflowRecord } from "../domain/workflow.ts";
 import {
@@ -16,14 +17,25 @@ import {
     type RenameAgentInput,
     type TransitionAgentInput,
 } from "./agents.ts";
+import {
+    type CompletionOutboxRecord,
+    CompletionRepository,
+    type DeclareCompletionInput,
+    type MailboxEffectRecord,
+    type MailboxEffectState,
+} from "./completions.ts";
 import { type Clock, type OpenStoreOptions, StorageDatabase } from "./database.ts";
 import {
     type ClaimMessagesInput,
     type DeadLetterMessageInput,
+    type ListNamespaceMessagesInput,
     MailboxRepository,
     type MaintenanceResult,
     type MessageMutationInput,
+    type PruneMessagesInput,
+    type PruneMessagesResult,
     type RenewMessageLeaseInput,
+    type RequeueDeadLetterInput,
     type RetryMessageInput,
 } from "./mailbox.ts";
 import {
@@ -38,15 +50,23 @@ export type {
     AgentLeaseInput,
     ClaimMessagesInput,
     Clock,
+    CompletionOutboxRecord,
     DeadLetterMessageInput,
+    DeclareCompletionInput,
     ListAgentsOptions,
+    ListNamespaceMessagesInput,
     ListWorkflowsOptions,
+    MailboxEffectRecord,
+    MailboxEffectState,
     MaintenanceResult,
     MessageMutationInput,
     OpenStoreOptions,
     PatchAgentInput,
+    PruneMessagesInput,
+    PruneMessagesResult,
     RenameAgentInput,
     RenewMessageLeaseInput,
+    RequeueDeadLetterInput,
     RetryMessageInput,
     TransitionAgentInput,
     TransitionWorkflowInput,
@@ -62,12 +82,14 @@ export class SqliteControlPlaneStore {
     readonly #database: StorageDatabase;
     readonly #agents: AgentRepository;
     readonly #mailbox: MailboxRepository;
+    readonly #completions: CompletionRepository;
     readonly #workflows: WorkflowRepository;
 
     private constructor(options: OpenStoreOptions) {
         this.#database = new StorageDatabase(options);
         this.#agents = new AgentRepository(this.#database);
         this.#mailbox = new MailboxRepository(this.#database);
+        this.#completions = new CompletionRepository(this.#database);
         this.#workflows = new WorkflowRepository(this.#database);
     }
 
@@ -87,8 +109,8 @@ export class SqliteControlPlaneStore {
         return this.#agents.get(agentId);
     }
 
-    getAgentByAlias(alias: string): AgentRecord {
-        return this.#agents.getByAlias(alias);
+    getAgentByAlias(alias: string, rootAgentId?: AgentId): AgentRecord {
+        return this.#agents.getByAlias(alias, rootAgentId);
     }
 
     listAgents(options?: ListAgentsOptions): AgentPage {
@@ -135,6 +157,14 @@ export class SqliteControlPlaneStore {
         return this.#mailbox.list(filter);
     }
 
+    listSentMessages(filter: OutboxFilter): MessagePage {
+        return this.#mailbox.listSent(filter);
+    }
+
+    requeueDeadLetterMessage(input: RequeueDeadLetterInput): MailboxMessage {
+        return this.#mailbox.requeueDeadLetter(input);
+    }
+
     claimMessages(input: ClaimMessagesInput): readonly MailboxMessage[] {
         return this.#mailbox.claim(input);
     }
@@ -161,6 +191,66 @@ export class SqliteControlPlaneStore {
 
     runMailboxMaintenance(): MaintenanceResult {
         return this.#mailbox.runMaintenance();
+    }
+
+    listDeadLetters(input: ListNamespaceMessagesInput): MessagePage {
+        return this.#mailbox.listDeadLetters(input);
+    }
+
+    mailboxStats(rootAgentId: AgentId) {
+        return this.#mailbox.stats(rootAgentId);
+    }
+
+    unresolvedRequiredMessages(agentId: AgentId, limit?: number): readonly MailboxMessage[] {
+        return this.#mailbox.unresolvedRequired(agentId, limit);
+    }
+
+    pruneMailbox(input: PruneMessagesInput): PruneMessagesResult {
+        return this.#mailbox.prune(input);
+    }
+
+    getCompletion(agentId: AgentId): CompletionOutboxRecord | undefined {
+        return this.#completions.get(agentId);
+    }
+
+    declareCompletion(input: DeclareCompletionInput): CompletionOutboxRecord {
+        return this.#completions.declare(input);
+    }
+
+    markCompletionEmitted(
+        agentId: AgentId,
+        invocationToken: string,
+        messageId: MessageId,
+    ): CompletionOutboxRecord {
+        return this.#completions.markEmitted(agentId, invocationToken, messageId);
+    }
+
+    markCompletionParentApplied(agentId: AgentId, invocationToken: string): CompletionOutboxRecord {
+        return this.#completions.markParentApplied(agentId, invocationToken);
+    }
+
+    markCompletionAcknowledged(
+        agentId: AgentId,
+        invocationToken: string,
+        messageId: MessageId,
+    ): CompletionOutboxRecord {
+        return this.#completions.markAcknowledged(agentId, invocationToken, messageId);
+    }
+
+    invalidateCompletion(agentId: AgentId, invocationToken: string): CompletionOutboxRecord {
+        return this.#completions.invalidate(agentId, invocationToken);
+    }
+
+    listPendingCompletions(parentAgentId: AgentId): readonly CompletionOutboxRecord[] {
+        return this.#completions.listPendingForParent(parentAgentId);
+    }
+
+    beginMailboxEffect(messageId: MessageId, effect: string): MailboxEffectRecord {
+        return this.#completions.beginEffect(messageId, effect);
+    }
+
+    advanceMailboxEffect(messageId: MessageId, state: MailboxEffectState): MailboxEffectRecord {
+        return this.#completions.advanceEffect(messageId, state);
     }
 
     createWorkflow(input: CreateWorkflowInput): WorkflowRecord {

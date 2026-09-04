@@ -7,6 +7,7 @@ import type { OrchestratorConfig } from "../../src/config.ts";
 import type { AgentRecord } from "../../src/domain/agent.ts";
 import { NotFoundError } from "../../src/domain/errors.ts";
 import type { AgentId } from "../../src/domain/ids.ts";
+import { DeterministicFailpoints, type Failpoint } from "../../src/faults.ts";
 import type {
     CreateHerdrSurfaceOptions,
     HerdrAgentInspection,
@@ -109,10 +110,15 @@ describe("AgentSupervisor", () => {
     let parent: AgentRecord;
     let herdr: FakeHerdr;
     let supervisor: AgentSupervisor;
+    let activeFailpoint: Failpoint | undefined;
 
     beforeEach(() => {
         directory = mkdtempSync(join(tmpdir(), "pi-herdr-supervisor-"));
-        store = SqliteControlPlaneStore.open({ filename: ":memory:" });
+        activeFailpoint = undefined;
+        store = SqliteControlPlaneStore.open({
+            filename: ":memory:",
+            failpoint: (point, context) => activeFailpoint?.(point, context),
+        });
         parent = store.registerAgent({ alias: "coordinator", role: "coordinator" });
         herdr = new FakeHerdr();
         const config: OrchestratorConfig = {
@@ -126,6 +132,9 @@ describe("AgentSupervisor", () => {
             leaseDurationMs: 60_000,
             messageTtlMs: 86_400_000,
             completionPollMs: 100,
+            maxDeliveryBytes: 512 * 1024,
+            mailboxRetentionMs: 30 * 86_400_000,
+            idempotencyRetentionMs: 90 * 86_400_000,
         };
         supervisor = new AgentSupervisor({
             store,
@@ -173,7 +182,7 @@ describe("AgentSupervisor", () => {
         assert.ok(start.args?.includes("--extension"));
         assert.ok(
             start.args?.includes(
-                "read,agent_complete,agent_mail_send,agent_mail_list,agent_mail_ack",
+                "read,agent_complete,agent_mail_send,agent_mail_list,agent_mail_ack,agent_mail_sent,agent_mail_retry,agent_directory",
             ),
         );
         assert.match(String(herdr.calls[2]?.value), /call agent_complete exactly once/u);
@@ -200,6 +209,47 @@ describe("AgentSupervisor", () => {
         assert.equal(herdr.calls.filter((call) => call.name === "steer").length, 0);
     });
 
+    test("rejects control for stopped agents while deferring ordinary mail until resume", async () => {
+        const spawned = await supervisor.spawn({
+            alias: "offline_worker",
+            role: "review",
+            prompt: "Review",
+            cwd: directory,
+        });
+        const stopped = await supervisor.stop(spawned.agent.id);
+        assert.equal(stopped.status, "stopped");
+        assert.throws(
+            () =>
+                supervisor.send({
+                    recipient: stopped.id,
+                    kind: "control",
+                    content: "stale correction",
+                }),
+            (error: unknown) => {
+                assert.match((error as Error).message, /stopped/u);
+                return true;
+            },
+        );
+        const deferred = supervisor.send({
+            recipient: stopped.id,
+            kind: "message",
+            content: "read after explicit resume",
+        });
+        assert.equal(deferred.message.state, "queued");
+    });
+
+    test("cannot resolve or control another coordinator namespace", async () => {
+        const otherParent = store.registerAgent({ alias: "other_parent", role: "coordinator" });
+        const otherChild = store.registerAgent({
+            alias: "foreign_child",
+            role: "worker",
+            parentAgentId: otherParent.id,
+        });
+        assert.throws(() => supervisor.resolveAgent(otherChild.id), /outside/u);
+        await assert.rejects(supervisor.interrupt(otherChild.id), /outside/u);
+        assert.equal(herdr.calls.filter((call) => call.name === "interrupt").length, 0);
+    });
+
     test("renames the live Herdr projections and durable alias", async () => {
         const spawned = await supervisor.spawn({
             alias: "old_name",
@@ -221,6 +271,34 @@ describe("AgentSupervisor", () => {
         });
         const inbox = store.listMessages({ recipientAgentId: spawned.agent.id });
         assert.equal(inbox.items[0]?.kind, "control");
+    });
+
+    test("rolls registry and Herdr projections back when rename notification fails", async () => {
+        const spawned = await supervisor.spawn({
+            alias: "rollback_name",
+            role: "review",
+            prompt: "Review",
+            cwd: directory,
+        });
+        activeFailpoint = new DeterministicFailpoints([{ point: "mailbox.enqueue.after_insert" }])
+            .hit;
+
+        await assert.rejects(
+            supervisor.rename({
+                agent: spawned.agent.id,
+                alias: "should_not_stick",
+                displayName: "Should not stick",
+            }),
+        );
+
+        const recovered = store.getAgent(spawned.agent.id);
+        assert.equal(recovered.alias, "rollback_name");
+        assert.equal(recovered.displayName, "rollback_name");
+        assert.deepEqual(herdr.calls.at(-1), {
+            name: "rename",
+            value: { alias: "rollback_name", label: "rollback_name" },
+        });
+        assert.equal(store.listMessages({ recipientAgentId: spawned.agent.id }).items.length, 0);
     });
 
     test("re-adopts persisted surfaces after a supervisor restart", async () => {
@@ -246,6 +324,9 @@ describe("AgentSupervisor", () => {
                 leaseDurationMs: 60_000,
                 messageTtlMs: 86_400_000,
                 completionPollMs: 100,
+                maxDeliveryBytes: 512 * 1024,
+                mailboxRetentionMs: 30 * 86_400_000,
+                idempotencyRetentionMs: 90 * 86_400_000,
             },
             parentAgentId: parent.id,
             sessionDir: directory,
@@ -375,6 +456,9 @@ describe("AgentSupervisor", () => {
                 leaseDurationMs: 60_000,
                 messageTtlMs: 86_400_000,
                 completionPollMs: 100,
+                maxDeliveryBytes: 512 * 1024,
+                mailboxRetentionMs: 30 * 86_400_000,
+                idempotencyRetentionMs: 90 * 86_400_000,
             },
             parentAgentId: parent.id,
             sessionDir: directory,

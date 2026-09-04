@@ -32,6 +32,7 @@ import { type AgentRow, toAgentRecord } from "./rows.ts";
 export interface ListAgentsOptions {
     readonly status?: AgentStatus;
     readonly parentAgentId?: AgentId;
+    readonly rootAgentId?: AgentId;
     readonly limit?: number;
     readonly cursor?: string;
 }
@@ -82,16 +83,25 @@ export class AgentRepository {
         assertJsonValue(metadata, "metadata");
         const now = this.#storage.now();
 
-        if (parentAgentId !== undefined) this.#getRow(parentAgentId);
+        const parent = parentAgentId === undefined ? undefined : this.#getRow(parentAgentId);
+        const rootAgentId =
+            input.rootAgentId === undefined
+                ? ((parent?.root_agent_id ?? parent?.id ?? id) as AgentId)
+                : parseAgentId(input.rootAgentId);
+        if (parent !== undefined && rootAgentId !== (parent.root_agent_id ?? parent.id)) {
+            throw new ValidationError("rootAgentId must match the parent ownership namespace", {
+                field: "rootAgentId",
+            });
+        }
 
         try {
             this.#storage.connection
                 .prepare(`
                     INSERT INTO agents(
                         id, alias, display_name, role, status, session_id, session_file,
-                        workspace_id, tab_id, pane_id, parent_agent_id, metadata_json,
+                        workspace_id, tab_id, pane_id, parent_agent_id, root_agent_id, metadata_json,
                         created_at, updated_at, last_seen_at, revision
-                    ) VALUES (?, ?, ?, ?, 'registered', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+                    ) VALUES (?, ?, ?, ?, 'registered', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
                 `)
                 .run(
                     id,
@@ -104,6 +114,7 @@ export class AgentRepository {
                     tabId ?? null,
                     paneId ?? null,
                     parentAgentId ?? null,
+                    rootAgentId,
                     canonicalJson(metadata),
                     now,
                     now,
@@ -122,11 +133,23 @@ export class AgentRepository {
         return toAgentRecord(this.#getRow(parseAgentId(agentId)));
     }
 
-    getByAlias(alias: string): AgentRecord {
+    getByAlias(alias: string, rootAgentId?: AgentId): AgentRecord {
         const normalized = validateAlias(alias);
-        const row = this.#storage.connection
-            .prepare("SELECT * FROM agents WHERE alias = ?")
-            .get(normalized) as AgentRow | undefined;
+        const root = rootAgentId === undefined ? undefined : parseAgentId(rootAgentId);
+        const rows = this.#storage.connection
+            .prepare(
+                root === undefined
+                    ? "SELECT * FROM agents WHERE alias = ? LIMIT 2"
+                    : "SELECT * FROM agents WHERE alias = ? AND root_agent_id = ? LIMIT 2",
+            )
+            .all(...(root === undefined ? [normalized] : [normalized, root])) as AgentRow[];
+        if (root === undefined && rows.length > 1) {
+            throw new ValidationError(
+                "Agent alias is ambiguous across coordinator namespaces; provide an immutable id or root scope",
+                { alias: normalized },
+            );
+        }
+        const row = rows[0];
         if (!row) throw new NotFoundError("agent", normalized);
         return toAgentRecord(row);
     }
@@ -146,6 +169,10 @@ export class AgentRepository {
         if (options.parentAgentId !== undefined) {
             conditions.push("parent_agent_id = ?");
             parameters.push(parseAgentId(options.parentAgentId));
+        }
+        if (options.rootAgentId !== undefined) {
+            conditions.push("root_agent_id = ?");
+            parameters.push(parseAgentId(options.rootAgentId));
         }
         if (cursor) {
             conditions.push("(created_at > ? OR (created_at = ? AND id > ?))");

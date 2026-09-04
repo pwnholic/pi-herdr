@@ -10,12 +10,14 @@ import type {
 import { type OrchestratorConfig, resolveConfig } from "../config.ts";
 import { type AgentRecord, type AgentStatus, canTransitionAgent } from "../domain/agent.ts";
 import { ValidationError } from "../domain/errors.ts";
-import { type AgentId, parseAgentId } from "../domain/ids.ts";
+import type { Failpoint } from "../faults.ts";
+import { type AgentId, parseAgentId, parseThreadId } from "../domain/ids.ts";
 import type { MailboxMessage, MessageKind, MessageState } from "../domain/mailbox.ts";
 import { assertJsonValue, type JsonValue, validateAlias } from "../domain/validation.ts";
 import { HerdrAdapter } from "../herdr/index.ts";
 import { AgentSupervisor } from "../orchestrator/index.ts";
 import { SqliteControlPlaneStore } from "../storage/index.ts";
+import { canonicalJson } from "../storage/json.ts";
 import { WorkflowEngine } from "../workflow/index.ts";
 import { type MailboxDisposition, MailboxPump } from "./mailbox-pump.ts";
 
@@ -62,6 +64,7 @@ export interface RuntimeDependencies {
         options: ConstructorParameters<typeof AgentSupervisor>[0],
     ) => AgentSupervisor;
     readonly onError?: (error: unknown) => void;
+    readonly failpoint?: Failpoint;
 }
 
 interface ActiveResources {
@@ -87,7 +90,11 @@ export interface ListMailInput {
     readonly states?: readonly MessageState[];
     readonly limit?: number;
     readonly cursor?: string;
+    readonly threadId?: string;
 }
+
+const PUBLIC_MESSAGE_KINDS = new Set<MessageKind>(["message", "request", "response", "event"]);
+const TERMINAL_AGENT_STATUSES = new Set<AgentStatus>(["completed", "failed"]);
 
 /** Session-scoped control plane. No Pi context is retained between callbacks. */
 export class PiHerdrRuntime {
@@ -103,6 +110,7 @@ export class PiHerdrRuntime {
         options: ConstructorParameters<typeof AgentSupervisor>[0],
     ) => AgentSupervisor;
     readonly #onError: (error: unknown) => void;
+    readonly #failpoint: Failpoint | undefined;
     #active: ActiveResources | undefined;
     #lastAgentMessages: AgentEndEvent["messages"] = [];
     #lastTurnAborted = false;
@@ -110,6 +118,7 @@ export class PiHerdrRuntime {
     #completionEmitted = false;
     #workflowTimer: NodeJS.Timeout | undefined;
     #workflowTick: Promise<unknown> | undefined;
+    #sessionManager: ExtensionContext["sessionManager"] | undefined;
 
     constructor(pi: ExtensionAPI, dependencies: RuntimeDependencies) {
         this.#pi = pi;
@@ -117,12 +126,20 @@ export class PiHerdrRuntime {
         this.#extensionPath = dependencies.extensionPath;
         this.#lifecycleExtensionPath = discoverHerdrLifecycleExtension(this.#environment);
         this.#openStore =
-            dependencies.openStore ?? ((filename) => SqliteControlPlaneStore.open({ filename }));
+            dependencies.openStore ??
+            ((filename) =>
+                SqliteControlPlaneStore.open({
+                    filename,
+                    ...(dependencies.failpoint === undefined
+                        ? {}
+                        : { failpoint: dependencies.failpoint }),
+                }));
         this.#createHerdr =
             dependencies.createHerdr ?? ((environment) => new HerdrAdapter({ environment }));
         this.#createSupervisor =
             dependencies.createSupervisor ?? ((options) => new AgentSupervisor(options));
         this.#onError = dependencies.onError ?? (() => undefined);
+        this.#failpoint = dependencies.failpoint;
     }
 
     get isActive(): boolean {
@@ -140,6 +157,7 @@ export class PiHerdrRuntime {
     async start(ctx: ExtensionContext): Promise<void> {
         await this.stop();
         this.#resetTurnState();
+        this.#sessionManager = ctx.sessionManager;
         const config = resolveConfig({
             sessionDir: ctx.sessionManager.getSessionDir(),
             cwd: ctx.cwd,
@@ -182,6 +200,7 @@ export class PiHerdrRuntime {
         if (this.#workflowTimer !== undefined) clearTimeout(this.#workflowTimer);
         this.#workflowTimer = undefined;
         if (this.#active === active) this.#active = undefined;
+        this.#sessionManager = undefined;
         active.store.close();
         this.#resetTurnState();
     }
@@ -200,7 +219,13 @@ export class PiHerdrRuntime {
         const lastAssistant = event.messages.findLast((message) => message.role === "assistant");
         this.#lastTurnAborted = lastAssistant?.stopReason === "aborted";
         if (this.#lastTurnAborted) {
-            if (!this.#completionEmitted) this.#pendingCompletion = undefined;
+            if (!this.#completionEmitted && this.#pendingCompletion !== undefined) {
+                active.store.invalidateCompletion(
+                    active.identity.id,
+                    this.#pendingCompletion.token,
+                );
+                this.#pendingCompletion = undefined;
+            }
             this.#transition(active.store, active.identity.id, "interrupted");
         }
     }
@@ -222,13 +247,21 @@ export class PiHerdrRuntime {
     declareCompletion(input: CompletionPayload, token: string): CompletionPayload {
         const active = this.#requireChild();
         const completion = validateCompletion(input, active.config.maxResultBytes);
+        const unresolved = active.store.unresolvedRequiredMessages(active.identity.id);
+        if (completion.status === "succeeded" && unresolved.length > 0) {
+            throw new ValidationError(
+                `Cannot complete with unresolved required mail: ${unresolved.map((message) => message.id).join(", ")}`,
+                { messageIds: unresolved.map((message) => message.id) },
+            );
+        }
         if (typeof token !== "string" || token.length === 0) {
             throw new ValidationError("agent_complete requires a non-empty invocation token");
         }
         if (this.#pendingCompletion !== undefined) {
             if (
                 this.#pendingCompletion.token !== token ||
-                JSON.stringify(this.#pendingCompletion.payload) !== JSON.stringify(completion)
+                canonicalJson(this.#pendingCompletion.payload as unknown as JsonValue) !==
+                    canonicalJson(completion as unknown as JsonValue)
             ) {
                 throw new ValidationError(
                     "agent_complete was already declared with another payload",
@@ -236,18 +269,36 @@ export class PiHerdrRuntime {
             }
             return this.#pendingCompletion.payload;
         }
+        const payload = completion as unknown as JsonValue;
+        assertJsonValue(payload, "completion");
+        const durable = active.store.declareCompletion({
+            agentId: active.identity.id,
+            invocationToken: token,
+            payload,
+        });
         this.#pendingCompletion = { payload: completion, token };
+        this.#completionEmitted = durable.state === "emitted";
         return completion;
     }
 
     sendMail(input: SendMailInput) {
         const active = this.#requireActive();
-        const recipient = resolveAgent(active.store, input.recipient);
+        const recipient = resolveAgent(active.store, input.recipient, active.identity.rootAgentId);
+        const kind = input.kind ?? "message";
+        if (!PUBLIC_MESSAGE_KINDS.has(kind)) {
+            throw new ValidationError(
+                `${kind} is reserved for authenticated Pi Herdr protocol traffic`,
+                { field: "kind" },
+            );
+        }
+        if (TERMINAL_AGENT_STATUSES.has(recipient.status)) {
+            throw new ValidationError(`Cannot send mail to terminal agent ${recipient.alias}`);
+        }
         if (active.supervisor !== undefined) {
-            return active.supervisor.send({
+            const delivery = active.supervisor.send({
                 senderAgentId: active.identity.id,
                 recipient: recipient.id,
-                kind: input.kind ?? "message",
+                kind,
                 content: input.content,
                 ...(input.idempotencyKey === undefined
                     ? {}
@@ -256,23 +307,25 @@ export class PiHerdrRuntime {
                     ? {}
                     : { replyToMessageId: parseMessageIdForTool(input.replyToMessageId) }),
             });
+            return interactionResult(active.store, recipient, delivery);
         }
         if (Buffer.byteLength(input.content, "utf8") > active.config.maxMessageBytes) {
             throw new ValidationError(
                 `content exceeds ${active.config.maxMessageBytes} UTF-8 bytes`,
             );
         }
-        return active.store.enqueueMessage({
+        const delivery = active.store.enqueueMessage({
             senderAgentId: active.identity.id,
             recipientAgentId: recipient.id,
-            kind: input.kind ?? "message",
+            kind,
             content: input.content,
             ...(input.idempotencyKey === undefined ? {} : { idempotencyKey: input.idempotencyKey }),
             ...(input.replyToMessageId === undefined
                 ? {}
                 : { replyToMessageId: parseMessageIdForTool(input.replyToMessageId) }),
-            expiresAt: Date.now() + active.config.messageTtlMs,
+            ttlMs: active.config.messageTtlMs,
         });
+        return interactionResult(active.store, recipient, delivery);
     }
 
     listMail(input: ListMailInput = {}) {
@@ -282,14 +335,83 @@ export class PiHerdrRuntime {
             ...(input.states === undefined ? {} : { states: input.states }),
             ...(input.limit === undefined ? {} : { limit: input.limit }),
             ...(input.cursor === undefined ? {} : { cursor: input.cursor }),
+            ...(input.threadId === undefined
+                ? {}
+                : { threadId: parseThreadIdForTool(input.threadId) }),
+        });
+    }
+
+    listSentMail(input: ListMailInput = {}) {
+        const active = this.#requireActive();
+        return active.store.listSentMessages({
+            senderAgentId: active.identity.id,
+            ...(input.states === undefined ? {} : { states: input.states }),
+            ...(input.limit === undefined ? {} : { limit: input.limit }),
+            ...(input.cursor === undefined ? {} : { cursor: input.cursor }),
+            ...(input.threadId === undefined
+                ? {}
+                : { threadId: parseThreadIdForTool(input.threadId) }),
+        });
+    }
+
+    listDeadLetters(input: Pick<ListMailInput, "limit" | "cursor"> = {}) {
+        const { store, identity } = this.requireParent();
+        return store.listDeadLetters({
+            rootAgentId: identity.rootAgentId,
+            ...(input.limit === undefined ? {} : { limit: input.limit }),
+            ...(input.cursor === undefined ? {} : { cursor: input.cursor }),
+        });
+    }
+
+    mailboxStatus() {
+        const { store, identity } = this.requireParent();
+        return store.mailboxStats(identity.rootAgentId);
+    }
+
+    retryDeadLetter(messageId: string): MailboxMessage {
+        const active = this.#requireActive();
+        const message = active.store.getMessage(parseMessageIdForTool(messageId));
+        const parentMayOperate =
+            !active.child && message.rootAgentId === active.identity.rootAgentId;
+        if (message.senderAgentId !== active.identity.id && !parentMayOperate) {
+            throw new ValidationError("message does not belong to this agent's outbox");
+        }
+        const recipient = resolveAgent(
+            active.store,
+            message.recipientAgentId,
+            active.identity.rootAgentId,
+        );
+        if (TERMINAL_AGENT_STATUSES.has(recipient.status)) {
+            throw new ValidationError(`Cannot retry mail to terminal agent ${recipient.alias}`);
+        }
+        return active.store.requeueDeadLetterMessage({
+            messageId: message.id,
+            senderAgentId: message.senderAgentId ?? active.identity.id,
+            expectedRevision: message.revision,
+            ttlMs: active.config.messageTtlMs,
+        });
+    }
+
+    listPeers(input: Pick<ListMailInput, "limit" | "cursor"> = {}) {
+        const active = this.#requireActive();
+        return active.store.listAgents({
+            rootAgentId: active.identity.rootAgentId,
+            ...(input.limit === undefined ? {} : { limit: input.limit }),
+            ...(input.cursor === undefined ? {} : { cursor: input.cursor }),
         });
     }
 
     async readMail(messageId: string): Promise<MailboxMessage> {
         const active = this.#requireActive();
-        await active.pump.pollNow();
-        const message = active.store.getMessage(parseMessageIdForTool(messageId));
+        const id = parseMessageIdForTool(messageId);
+        const before = active.store.getMessage(id);
+        this.#assertRecipient(before, active.identity.id);
+        if (before.state === "queued") await active.pump.pollMessage(id);
+        const message = active.store.getMessage(id);
         this.#assertRecipient(message, active.identity.id);
+        if (message.state === "queued" || message.state === "delivered") {
+            throw new ValidationError("message is not currently readable by this Pi process");
+        }
         return message;
     }
 
@@ -359,6 +481,20 @@ export class PiHerdrRuntime {
             },
             expectedRevision: identity.revision,
         });
+        const durableCompletion = store.getCompletion(identity.id);
+        if (
+            durableCompletion !== undefined &&
+            (durableCompletion.state === "declared" || durableCompletion.state === "emitted")
+        ) {
+            this.#pendingCompletion = {
+                payload: validateCompletion(
+                    durableCompletion.payload as unknown as CompletionPayload,
+                    config.maxResultBytes,
+                ),
+                token: durableCompletion.invocationToken,
+            };
+            this.#completionEmitted = durableCompletion.state === "emitted";
+        }
         this.#pi.setSessionName(identity.displayName);
         const pump = this.#createPump(store, identity.id, config, true);
         return {
@@ -419,8 +555,26 @@ export class PiHerdrRuntime {
                 ? {}
                 : { lifecycleExtensionPath: this.#lifecycleExtensionPath }),
             ...(context === undefined ? {} : { workspaceId: context.workspaceId }),
+            ...(this.#failpoint === undefined ? {} : { failpoint: this.#failpoint }),
         });
         await supervisor.recover();
+        for (const completion of store.listPendingCompletions(identity.id)) {
+            if (completion.messageId === undefined) continue;
+            const message = store.getMessage(completion.messageId);
+            if (message.state === "dead_letter") {
+                store.requeueDeadLetterMessage({
+                    messageId: message.id,
+                    senderAgentId: completion.agentId,
+                    expectedRevision: message.revision,
+                });
+            } else if (message.state === "acked" && completion.state === "parent_applied") {
+                store.markCompletionAcknowledged(
+                    completion.agentId,
+                    completion.invocationToken,
+                    message.id,
+                );
+            }
+        }
         const workflowEngine = new WorkflowEngine({
             store,
             supervisor,
@@ -451,8 +605,20 @@ export class PiHerdrRuntime {
             leaseMs: config.leaseDurationMs,
             pollMs: config.completionPollMs,
             batchSize: config.maxPageSize,
+            maxDeliveryBytes: config.maxDeliveryBytes,
+            retentionMs: config.mailboxRetentionMs,
+            idempotencyRetentionMs: config.idempotencyRetentionMs,
             dispatch: async (message) =>
                 this.#dispatchMessage(message, child, identity, supervisor),
+            onAcknowledged: (original) => {
+                if (original.kind !== "result" || original.senderAgentId === undefined) return;
+                const metadata = jsonObject(original.metadata);
+                const token = metadata.completionToken;
+                if (typeof token !== "string") return;
+                const completion = store.getCompletion(original.senderAgentId);
+                if (completion?.state !== "parent_applied") return;
+                store.markCompletionAcknowledged(original.senderAgentId, token, original.id);
+            },
             onError: this.#onError,
         });
     }
@@ -487,37 +653,60 @@ export class PiHerdrRuntime {
                 throw new ValidationError("result metadata agentId does not match its sender");
             }
             const record = supervisor.resolveAgent(sender);
+            const completionToken =
+                typeof metadata.completionToken === "string"
+                    ? metadata.completionToken
+                    : this.#requireActive().store.getCompletion(record.id)?.invocationToken;
             const workflowEngine = this.#requireActive().workflowEngine;
-            if (workflowEngine !== undefined && hasWorkflowBinding(record)) {
-                const completion = parseCompletionResult(message.content);
-                await workflowEngine.acceptCompletion({
-                    agentId: record.id,
-                    status,
-                    result: completion,
-                    ...(status === "failed" ? { error: completionSummary(completion) } : {}),
-                });
+            const store = this.#requireActive().store;
+            let effect = store.beginMailboxEffect(message.id, "completion");
+            if (effect.state === "applying") {
+                this.#hit("completion.apply.before", { messageId: message.id });
+                if (workflowEngine !== undefined && hasWorkflowBinding(record)) {
+                    const completion = parseCompletionResult(message.content);
+                    await workflowEngine.acceptCompletion({
+                        agentId: record.id,
+                        status,
+                        result: completion,
+                        ...(status === "failed" ? { error: completionSummary(completion) } : {}),
+                    });
+                }
+                this.#transition(store, record.id, status === "succeeded" ? "completed" : "failed");
+                if (completionToken !== undefined) {
+                    store.markCompletionParentApplied(record.id, completionToken);
+                }
+                effect = store.advanceMailboxEffect(message.id, "applied");
+                this.#hit("completion.apply.after", { messageId: message.id });
             }
-            this.#transition(
-                this.#requireActive().store,
-                record.id,
-                status === "succeeded" ? "completed" : "failed",
-            );
-            await supervisor.finalizeCompletedAgent(record.id);
-            this.#pi.sendMessage(mailboxCustomMessage(message, true), {
-                triggerTurn: true,
-                deliverAs: "steer",
-            });
-            await workflowEngine?.tick();
+            if (effect.state === "applied") {
+                if (this.#hasPiMailboxMessage(message.id)) {
+                    await workflowEngine?.tick();
+                    store.advanceMailboxEffect(message.id, "notified");
+                    return "ack";
+                }
+                await supervisor.finalizeCompletedAgent(record.id);
+                this.#hit("completion.notification.before", { messageId: message.id });
+                this.#pi.sendMessage(mailboxCustomMessage(message, true), {
+                    triggerTurn: true,
+                    deliverAs: message.deliveryMode,
+                });
+                this.#hit("completion.notification.after", { messageId: message.id });
+                await workflowEngine?.tick();
+                store.advanceMailboxEffect(message.id, "notified");
+            }
             return "ack";
         }
 
         if (message.recipientAgentId !== identity) {
             throw new ValidationError("Mailbox dispatcher received a message for another agent");
         }
+        if (this.#hasPiMailboxMessage(message.id)) return "read";
+        this.#hit("mailbox.injection.before", { messageId: message.id });
         this.#pi.sendMessage(mailboxCustomMessage(message), {
             triggerTurn: true,
-            deliverAs: "steer",
+            deliverAs: message.deliveryMode,
         });
+        this.#hit("mailbox.injection.after", { messageId: message.id });
         return "read";
     }
 
@@ -537,7 +726,7 @@ export class PiHerdrRuntime {
                 `completion result exceeds ${active.config.maxResultBytes} UTF-8 bytes`,
             );
         }
-        active.store.enqueueMessage({
+        const delivery = active.store.enqueueMessage({
             senderAgentId: active.identity.id,
             recipientAgentId: active.parentAgentId,
             kind: "result",
@@ -546,10 +735,15 @@ export class PiHerdrRuntime {
                 action: "completion",
                 agentId: active.identity.id,
                 status: completion.status,
+                completionToken: declaration.token,
             },
             idempotencyKey: completionKey(active.identity.id, declaration.token),
-            expiresAt: Date.now() + active.config.messageTtlMs,
         });
+        active.store.markCompletionEmitted(
+            active.identity.id,
+            declaration.token,
+            delivery.message.id,
+        );
         this.#transition(
             active.store,
             active.identity.id,
@@ -601,6 +795,32 @@ export class PiHerdrRuntime {
         this.#completionEmitted = false;
     }
 
+    #hasPiMailboxMessage(messageId: string): boolean {
+        const manager = this.#sessionManager as
+            | {
+                  getBranch?: () => readonly unknown[];
+                  getEntries?: () => readonly unknown[];
+              }
+            | undefined;
+        const entries = manager?.getBranch?.() ?? manager?.getEntries?.() ?? [];
+        return entries.some((entry) => {
+            if (typeof entry !== "object" || entry === null) return false;
+            const value = entry as {
+                type?: unknown;
+                customType?: unknown;
+                details?: unknown;
+            };
+            if (value.type !== "custom_message" || value.customType !== "pi-herdr-mail") {
+                return false;
+            }
+            return jsonObject(value.details as JsonValue).messageId === messageId;
+        });
+    }
+
+    #hit(point: string, context?: Readonly<Record<string, unknown>>): void {
+        this.#failpoint?.(point, context);
+    }
+
     #scheduleWorkflowTick(delay: number): void {
         if (this.#active?.workflowEngine === undefined) return;
         this.#workflowTimer = setTimeout(() => {
@@ -638,15 +858,54 @@ function findCoordinator(
     return undefined;
 }
 
-function resolveAgent(store: SqliteControlPlaneStore, identifier: string): AgentRecord {
-    return UUID_PATTERN.test(identifier)
+function resolveAgent(
+    store: SqliteControlPlaneStore,
+    identifier: string,
+    rootAgentId?: AgentId,
+): AgentRecord {
+    const agent = UUID_PATTERN.test(identifier)
         ? store.getAgent(parseAgentId(identifier))
-        : store.getAgentByAlias(validateAlias(identifier));
+        : store.getAgentByAlias(validateAlias(identifier), rootAgentId);
+    if (rootAgentId !== undefined && agent.rootAgentId !== rootAgentId) {
+        throw new ValidationError("Agent is outside this communication namespace");
+    }
+    return agent;
+}
+
+function interactionResult(
+    store: SqliteControlPlaneStore,
+    recipient: AgentRecord,
+    delivery: ReturnType<SqliteControlPlaneStore["enqueueMessage"]>,
+) {
+    const segments: string[] = [];
+    let current = recipient;
+    while (current.parentAgentId !== undefined) {
+        segments.push(current.alias);
+        current = store.getAgent(current.parentAgentId);
+    }
+    return {
+        ...delivery,
+        recipient: {
+            id: recipient.id,
+            alias: recipient.alias,
+            path: `/root${segments.length === 0 ? "" : `/${segments.toReversed().join("/")}`}`,
+            status: recipient.status,
+            deliveryContract: ["starting", "running", "idle", "blocked", "interrupted"].includes(
+                recipient.status,
+            )
+                ? ("live_mailbox" as const)
+                : ("deferred_until_resume" as const),
+        },
+    };
 }
 
 function parseMessageIdForTool(value: string) {
     if (!UUID_PATTERN.test(value)) throw new ValidationError("messageId must be a UUID");
     return value.toLowerCase() as Parameters<SqliteControlPlaneStore["getMessage"]>[0];
+}
+
+function parseThreadIdForTool(value: string) {
+    return parseThreadId(value);
 }
 
 function completionKey(agentId: AgentId, token: string): string {

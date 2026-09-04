@@ -10,6 +10,7 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import type { AgentRecord } from "../../src/domain/agent.ts";
 import type { AgentId } from "../../src/domain/ids.ts";
+import { DeterministicFailpoints } from "../../src/faults.ts";
 import { PiHerdrRuntime } from "../../src/pi/runtime.ts";
 import { registerPiHerdrTools } from "../../src/pi/tools.ts";
 import { SqliteControlPlaneStore } from "../../src/storage/index.ts";
@@ -43,11 +44,15 @@ function fixture() {
         expectedRevision: child.revision,
     });
     const sent: Array<{ message: unknown; options: unknown }> = [];
+    const entries: unknown[] = [];
     const names: string[] = [];
     const pi = {
         setSessionName: (name: string) => names.push(name),
         getSessionName: () => undefined,
-        sendMessage: (message: unknown, options: unknown) => sent.push({ message, options }),
+        sendMessage: (message: unknown, options: unknown) => {
+            sent.push({ message, options });
+            entries.push({ type: "custom_message", ...(message as object) });
+        },
     } as unknown as ExtensionAPI;
     const context = {
         cwd: directory,
@@ -55,6 +60,7 @@ function fixture() {
             getSessionDir: () => directory,
             getSessionId: () => "44444444-4444-4444-8444-444444444444",
             getSessionFile: () => join(directory, "session.jsonl"),
+            getEntries: () => entries,
         },
         shutdown: () => {
             throw new Error("child runtime must not request shutdown");
@@ -69,7 +75,19 @@ function fixture() {
             PI_HERDR_COMPLETION_POLL_MS: "60000",
         },
     });
-    return { directory, filename, setupStore, parent, child, pi, context, runtime, sent, names };
+    return {
+        directory,
+        filename,
+        setupStore,
+        parent,
+        child,
+        pi,
+        context,
+        runtime,
+        sent,
+        names,
+        entries,
+    };
 }
 
 function assistantEvent(stopReason: "stop" | "aborted", text = "final answer"): AgentEndEvent {
@@ -150,6 +168,32 @@ test("one durable correction is injected exactly once through Pi steer delivery"
     setupStore.close();
 });
 
+test("read-by-id never exposes a later queued payload ahead of FIFO ownership", async () => {
+    const { runtime, context, setupStore, child, parent } = fixture();
+    const first = setupStore.enqueueMessage({
+        senderAgentId: parent.id,
+        recipientAgentId: child.id,
+        kind: "message",
+        content: "first",
+    }).message;
+    const second = setupStore.enqueueMessage({
+        senderAgentId: parent.id,
+        recipientAgentId: child.id,
+        kind: "message",
+        content: "second",
+    }).message;
+    await runtime.start(context);
+
+    await assert.rejects(runtime.readMail(second.id), /not currently readable/u);
+    await runtime.readMail(first.id);
+    await runtime.acknowledgeMail(first.id);
+    const accepted = await runtime.readMail(second.id);
+    assert.equal(accepted.id, second.id);
+    assert.equal(accepted.state, "read");
+    await runtime.stop();
+    setupStore.close();
+});
+
 test("child registration exposes completion but not parent control tools", () => {
     const names: string[] = [];
     const definitions: Array<{ name: string; execute: (...args: never[]) => unknown }> = [];
@@ -166,6 +210,10 @@ test("child registration exposes completion but not parent control tools", () =>
 
     assert.ok(names.includes("agent_complete"));
     assert.ok(names.includes("agent_mail_send"));
+    assert.ok(names.includes("agent_mail_sent"));
+    assert.ok(!names.includes("agent_mail_dead_letters"));
+    assert.ok(!names.includes("agent_mail_status"));
+    assert.ok(names.includes("agent_directory"));
     assert.ok(!names.includes("agent_spawn"));
     assert.ok(!names.includes("workflow_start"));
     assert.equal(definitions.length, names.length);
@@ -215,6 +263,8 @@ test("parent registration exposes workflow engine tools but not child completion
     registerPiHerdrTools(pi, {} as PiHerdrRuntime, false);
 
     assert.ok(names.includes("agent_spawn"));
+    assert.ok(names.includes("agent_mail_dead_letters"));
+    assert.ok(names.includes("agent_mail_status"));
     assert.ok(names.includes("workflow_start"));
     assert.ok(names.includes("workflow_cancel"));
     assert.ok(!names.includes("agent_complete"));
@@ -268,10 +318,15 @@ test("parent finalizes a result before notification and automatic acknowledgemen
     temporaryDirectories.push(directory);
     const filename = join(directory, "control.sqlite");
     const order: string[] = [];
+    const entries: unknown[] = [];
+    const failpoints = new DeterministicFailpoints([{ point: "completion.notification.after" }]);
     const pi = {
         getSessionName: () => "Coordinator",
         setSessionName: () => undefined,
-        sendMessage: () => order.push("notify"),
+        sendMessage: (message: unknown) => {
+            order.push("notify");
+            entries.push({ type: "custom_message", ...(message as object) });
+        },
     } as unknown as ExtensionAPI;
     const context = {
         cwd: directory,
@@ -279,6 +334,7 @@ test("parent finalizes a result before notification and automatic acknowledgemen
             getSessionDir: () => directory,
             getSessionId: () => "55555555-5555-4555-8555-555555555555",
             getSessionFile: () => join(directory, "parent.jsonl"),
+            getEntries: () => entries,
         },
     } as unknown as ExtensionContext;
     const runtime = new PiHerdrRuntime(pi, {
@@ -287,6 +343,7 @@ test("parent finalizes a result before notification and automatic acknowledgemen
             PI_HERDR_DB: filename,
             PI_HERDR_COMPLETION_POLL_MS: "60000",
         },
+        failpoint: failpoints.hit,
         createHerdr: () => ({ isManagedEnvironment: () => false }) as never,
         createSupervisor: (options) =>
             ({
@@ -330,6 +387,8 @@ test("parent finalizes a result before notification and automatic acknowledgemen
         metadata: { action: "completion", agentId: child.id, status: "succeeded" },
     });
 
+    await assert.rejects(runtime.readMail(result.message.id));
+    await new Promise((resolve) => setTimeout(resolve, 300));
     await runtime.readMail(result.message.id);
 
     assert.deepEqual(order, ["finalize", "notify"]);
@@ -355,4 +414,133 @@ test("distinct completion invocation tokens permit a later resumed assignment", 
     assert.equal(current(setupStore, child).status, "completed");
     await runtime.stop();
     setupStore.close();
+});
+
+test("restores a declared completion after child runtime replacement", async () => {
+    const { runtime, context, setupStore, child, parent, filename, directory, pi } = fixture();
+    await runtime.start(context);
+    runtime.onAgentStart();
+    runtime.declareCompletion({ status: "succeeded", summary: "durable" }, "crash-token");
+    await runtime.stop();
+
+    const restarted = new PiHerdrRuntime(pi, {
+        extensionPath: join(directory, "extension.ts"),
+        environment: {
+            PI_HERDR_AGENT_ID: child.id,
+            PI_HERDR_PARENT_ID: parent.id,
+            PI_HERDR_DB: filename,
+            PI_HERDR_COMPLETION_POLL_MS: "60000",
+        },
+    });
+    await restarted.start(context);
+    restarted.onAgentEnd(assistantEvent("stop"));
+    await restarted.onAgentSettled(context);
+
+    const results = setupStore.listMessages({ recipientAgentId: parent.id }).items;
+    assert.equal(results.filter((message) => message.kind === "result").length, 1);
+    assert.equal(setupStore.getCompletion(child.id)?.state, "emitted");
+    await restarted.stop();
+    setupStore.close();
+});
+
+test("rejects successful completion while required inbox mail is unresolved", async () => {
+    const { runtime, context, setupStore, child, parent } = fixture();
+    await runtime.start(context);
+    const required = setupStore.enqueueMessage({
+        senderAgentId: parent.id,
+        recipientAgentId: child.id,
+        kind: "request",
+        content: "must answer",
+    }).message;
+
+    assert.throws(
+        () => runtime.declareCompletion({ status: "succeeded", summary: "ignored" }, "blocked"),
+        (error: unknown) => {
+            assert.match((error as Error).message, new RegExp(required.id, "u"));
+            return true;
+        },
+    );
+    assert.equal(
+        runtime.declareCompletion(
+            { status: "failed", summary: "blocked by unresolved required mail" },
+            "failure-report",
+        ).status,
+        "failed",
+    );
+    await runtime.stop();
+    setupStore.close();
+});
+
+test("ordinary peer mail uses follow-up delivery semantics", async () => {
+    const { runtime, context, setupStore, child, parent, sent } = fixture();
+    const queued = setupStore.enqueueMessage({
+        senderAgentId: parent.id,
+        recipientAgentId: child.id,
+        kind: "message",
+        content: "informational",
+    });
+    await runtime.start(context);
+    await runtime.readMail(queued.message.id);
+
+    assert.deepEqual(sent[0]?.options, { triggerTurn: true, deliverAs: "followUp" });
+    await runtime.stop();
+    setupStore.close();
+});
+
+test("child discovery and direct peer mail expose a stable interaction path", async () => {
+    const { runtime, context, setupStore, parent } = fixture();
+    const peer = setupStore.registerAgent({
+        alias: "durable_store",
+        role: "storage",
+        parentAgentId: parent.id,
+    });
+    const startingPeer = setupStore.transitionAgent({
+        agentId: peer.id,
+        status: "starting",
+        patch: {},
+        expectedRevision: peer.revision,
+    });
+    await runtime.start(context);
+
+    const directory = runtime.listPeers();
+    assert.ok(directory.items.some((agent) => agent.id === startingPeer.id));
+    const interaction = runtime.sendMail({
+        recipient: startingPeer.id,
+        content: "coordinate transaction boundary",
+    });
+    assert.equal(interaction.recipient.path, "/root/durable_store");
+    assert.equal(interaction.recipient.deliveryContract, "live_mailbox");
+    assert.equal(setupStore.getMessage(interaction.message.id).recipientAgentId, startingPeer.id);
+    await runtime.stop();
+    setupStore.close();
+});
+
+test("recovery detects a Pi-persisted injection after failure and does not duplicate it", async () => {
+    const base = fixture();
+    const failpoints = new DeterministicFailpoints([{ point: "mailbox.injection.after" }]);
+    const runtime = new PiHerdrRuntime(base.pi, {
+        extensionPath: join(base.directory, "extension.ts"),
+        environment: {
+            PI_HERDR_AGENT_ID: base.child.id,
+            PI_HERDR_PARENT_ID: base.parent.id,
+            PI_HERDR_DB: base.filename,
+            PI_HERDR_COMPLETION_POLL_MS: "60000",
+        },
+        failpoint: failpoints.hit,
+    });
+    const queued = base.setupStore.enqueueMessage({
+        senderAgentId: base.parent.id,
+        recipientAgentId: base.child.id,
+        kind: "message",
+        content: "inject exactly once",
+    });
+    await runtime.start(base.context);
+    await assert.rejects(runtime.readMail(queued.message.id));
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    await runtime.readMail(queued.message.id);
+
+    assert.equal(base.sent.length, 1);
+    assert.equal(base.setupStore.getMessage(queued.message.id).state, "read");
+    await runtime.stop();
+    base.setupStore.close();
 });
