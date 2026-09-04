@@ -517,6 +517,7 @@ export class AgentSupervisor {
         displayName: string,
     ): string[] {
         const args = [
+            "--no-extensions",
             "--session-id",
             sessionId,
             "--session-dir",

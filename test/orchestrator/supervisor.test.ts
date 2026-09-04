@@ -161,6 +161,7 @@ describe("AgentSupervisor", () => {
             ["create", "start", "prompt"],
         );
         const start = herdr.calls[1]?.value as StartPiOptions;
+        assert.equal(start.args?.[0], "--no-extensions");
         assert.ok(start.args?.includes("--session-id"));
         assert.ok(start.args?.includes("--extension"));
         assert.ok(
