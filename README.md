@@ -46,7 +46,7 @@ duplicated through terminal input.
 
 - Node.js `>=22.19.0` (Pi itself runs under Node)
 - Bun `1.4.0` or newer for deterministic package installation
-- Pi `0.84.4`
+- Pi `0.85.0`
 - Herdr `0.8.2`
 
 All npm dependencies are exact-pinned in `package.json` and `bun.lock`.
