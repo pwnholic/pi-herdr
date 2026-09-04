@@ -126,7 +126,7 @@ export class AgentSupervisor {
     }
 
     async spawn(request: SpawnAgentRequest, signal?: AbortSignal): Promise<SpawnAgentResult> {
-        this.#assertContent(request.prompt, this.#config.maxResultBytes, "prompt");
+        this.#assertContent(request.prompt, this.#config.maxMessageBytes, "prompt");
         const alias = validateAlias(request.alias);
         const displayName = validateLabel(request.displayName ?? alias, "displayName");
         const role = validateLabel(request.role, "role");
