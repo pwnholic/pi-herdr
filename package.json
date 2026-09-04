@@ -1,0 +1,60 @@
+{
+  "name": "pi-herdr",
+  "version": "0.1.0",
+  "description": "Durable multi-agent orchestration for Pi on Herdr",
+  "type": "module",
+  "license": "MIT",
+  "packageManager": "bun@1.4.0",
+  "files": [
+    "src",
+    "docs",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "pi",
+    "herdr",
+    "multi-agent",
+    "orchestration",
+    "sqlite"
+  ],
+  "engines": {
+    "node": ">=22.19.0",
+    "bun": ">=1.4.0"
+  },
+  "scripts": {
+    "test": "node --test --experimental-strip-types 'test/**/*.test.ts'",
+    "test:coverage": "node --test --experimental-strip-types --experimental-test-coverage 'test/**/*.test.ts'",
+    "typecheck": "tsc --noEmit",
+    "format": "biome format --write src test",
+    "format:check": "biome format src test",
+    "lint": "oxlint src test",
+    "check": "bun run typecheck && bun run test && bun run format:check && bun run lint"
+  },
+  "dependencies": {
+    "better-sqlite3": "13.0.3"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "0.84.4",
+    "@earendil-works/pi-coding-agent": "0.84.4",
+    "@earendil-works/pi-tui": "0.84.4",
+    "typebox": "1.3.25"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "2.5.12",
+    "@earendil-works/pi-ai": "0.84.4",
+    "@earendil-works/pi-coding-agent": "0.84.4",
+    "@earendil-works/pi-tui": "0.84.4",
+    "@types/better-sqlite3": "9.6.0",
+    "@types/bun": "1.4.0",
+    "@types/node": "26.4.1",
+    "oxlint": "1.81.0",
+    "typebox": "1.3.25",
+    "typescript": "7.0.2"
+  },
+  "pi": {
+    "extensions": [
+      "./src/extension.ts"
+    ]
+  }
+}
