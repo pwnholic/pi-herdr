@@ -10,10 +10,10 @@ import type {
 import { type OrchestratorConfig, resolveConfig } from "../config.ts";
 import { type AgentRecord, type AgentStatus, canTransitionAgent } from "../domain/agent.ts";
 import { ValidationError } from "../domain/errors.ts";
-import type { Failpoint } from "../faults.ts";
 import { type AgentId, parseAgentId, parseThreadId } from "../domain/ids.ts";
 import type { MailboxMessage, MessageKind, MessageState } from "../domain/mailbox.ts";
 import { assertJsonValue, type JsonValue, validateAlias } from "../domain/validation.ts";
+import type { Failpoint } from "../faults.ts";
 import { HerdrAdapter } from "../herdr/index.ts";
 import { AgentSupervisor } from "../orchestrator/index.ts";
 import { SqliteControlPlaneStore } from "../storage/index.ts";
@@ -409,7 +409,11 @@ export class PiHerdrRuntime {
         if (before.state === "queued") await active.pump.pollMessage(id);
         const message = active.store.getMessage(id);
         this.#assertRecipient(message, active.identity.id);
-        if (message.state === "queued" || message.state === "delivered") {
+        if (
+            message.state === "queued" ||
+            message.state === "delivered" ||
+            (message.state === "read" && message.leaseOwner !== active.pump.owner)
+        ) {
             throw new ValidationError("message is not currently readable by this Pi process");
         }
         return message;
@@ -578,6 +582,7 @@ export class PiHerdrRuntime {
         const workflowEngine = new WorkflowEngine({
             store,
             supervisor,
+            rootAgentId: identity.rootAgentId,
             maxConcurrent: config.maxLiveAgents,
         });
         const pump = this.#createPump(store, identity.id, config, false, supervisor);

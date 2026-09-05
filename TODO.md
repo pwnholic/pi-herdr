@@ -2,7 +2,7 @@
 
 Audit scope: parent-to-child, child-to-parent, and child-to-child communication.
 
-Baseline: `813a1f7` (`dev`), audited 2026-09-05. The current mailbox is durable and
+Baseline: `2517914` (`dev`), audited 2026-09-05. The current mailbox is durable and
 at-least-once. It already has SQLite transactions, WAL, foreign keys, immutable agent IDs,
 optimistic revisions, lease ownership, retries, acknowledgements, TTL, dead-letter state, and
 direct routing without a parent-model relay. The work below covers the remaining correctness,

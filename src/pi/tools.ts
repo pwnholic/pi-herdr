@@ -446,7 +446,11 @@ function registerParentTools(pi: ExtensionAPI, runtime: PiHerdrRuntime): void {
             cursor: Type.Optional(Type.String({ minLength: 1 })),
         }),
         async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
-            const result = runtime.requireParent().store.listWorkflows(params);
+            const parent = runtime.requireParent();
+            const result = parent.store.listWorkflows({
+                rootAgentId: parent.identity.rootAgentId,
+                ...params,
+            });
             return toolResult("workflow_list", result, `${result.items.length} workflow(s)`);
         },
     });

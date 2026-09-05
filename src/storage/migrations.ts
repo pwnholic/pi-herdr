@@ -10,7 +10,7 @@ interface Migration {
 const MIGRATIONS: readonly Migration[] = [
     {
         version: 1,
-        name: "pi-herdr-control-plane-v1",
+        name: "pi-herdr-control-plane-v1-final",
         sql: `
       CREATE TABLE agents (
         id TEXT PRIMARY KEY,
@@ -133,6 +133,7 @@ const MIGRATIONS: readonly Migration[] = [
 
       CREATE TABLE workflows (
         id TEXT PRIMARY KEY,
+        root_agent_id TEXT NOT NULL REFERENCES agents(id) ON UPDATE RESTRICT ON DELETE RESTRICT,
         name TEXT NOT NULL,
         status TEXT NOT NULL CHECK (status IN ('pending','running','succeeded','failed','cancelled')),
         metadata_json TEXT NOT NULL,
@@ -170,7 +171,8 @@ const MIGRATIONS: readonly Migration[] = [
         CHECK (node_id != depends_on_node_id)
       ) STRICT;
 
-      CREATE INDEX workflows_status_created_idx ON workflows(status, created_at, id);
+      CREATE INDEX workflows_root_status_created_idx
+        ON workflows(root_agent_id, status, created_at, id);
       CREATE INDEX workflow_nodes_status_idx ON workflow_nodes(workflow_id, status, node_id);
       CREATE INDEX workflow_dependencies_reverse_idx
         ON workflow_node_dependencies(workflow_id, depends_on_node_id, node_id);

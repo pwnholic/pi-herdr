@@ -257,11 +257,11 @@ export class SqliteControlPlaneStore {
         return this.#workflows.create(input);
     }
 
-    getWorkflow(workflowId: WorkflowId): WorkflowRecord {
-        return this.#workflows.get(workflowId);
+    getWorkflow(workflowId: WorkflowId, rootAgentId: AgentId): WorkflowRecord {
+        return this.#workflows.get(workflowId, rootAgentId);
     }
 
-    listWorkflows(options?: ListWorkflowsOptions): WorkflowPage {
+    listWorkflows(options: ListWorkflowsOptions): WorkflowPage {
         return this.#workflows.list(options);
     }
 

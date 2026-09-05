@@ -67,6 +67,7 @@ export interface MessageRow {
 
 export interface WorkflowRow {
     readonly id: string;
+    readonly root_agent_id: string;
     readonly name: string;
     readonly status: WorkflowStatus;
     readonly metadata_json: string;
@@ -173,6 +174,7 @@ export function toWorkflowRecord(
 ): WorkflowRecord {
     return {
         id: row.id as WorkflowId,
+        rootAgentId: row.root_agent_id as AgentId,
         name: row.name,
         status: row.status,
         metadata: parseStoredJson(row.metadata_json),

@@ -22,9 +22,9 @@ events.
 8. External commands use argument arrays, bounded output, cancellation, deadlines, structured
    errors, and recovery checks.
 9. The supervisor closes only Herdr resources represented by its owned capability objects.
-10. Every agent and message belongs to one immutable root coordinator namespace. Cross-root mail,
-    peer control, sender impersonation through public tools, and foreign lifecycle control fail at
-    the storage/runtime boundary.
+10. Every agent, message, and workflow belongs to one immutable root coordinator namespace.
+    Cross-root mail, peer control, sender impersonation through public tools, foreign workflow
+    access, and foreign lifecycle control fail at the storage/runtime boundary.
 
 ## Components
 
@@ -95,7 +95,8 @@ queue depth, pending bytes, oldest age, and dead letters to the owning coordinat
 Workflow nodes are validated as a DAG and reserved transactionally before agent launch. A stable
 hash-derived Herdr alias and metadata binding `(workflowId, nodeId, spawnKey)` let a restarted
 coordinator reconcile a running reservation without duplicate spawn. Concurrency is globally
-bounded and duplicate ticks coalesce.
+bounded within that coordinator namespace and duplicate ticks coalesce. Every workflow read,
+list, mutation, completion, and cancellation is scoped by its persisted root coordinator ID.
 
 ## Runtime boundary
 

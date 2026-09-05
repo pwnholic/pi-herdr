@@ -12,14 +12,17 @@ import { WorkflowEngine, type WorkflowSupervisor } from "../../src/workflow/inde
 
 class FakeSupervisor implements WorkflowSupervisor {
     readonly store: SqliteControlPlaneStore;
+    readonly rootAgentId: AgentId;
     readonly calls: SpawnAgentRequest[] = [];
     readonly stopped: AgentId[] = [];
     activeSpawns = 0;
     maxActiveSpawns = 0;
     spawnGate: Promise<void> | undefined;
 
-    constructor(store: SqliteControlPlaneStore) {
+    constructor(store: SqliteControlPlaneStore, rootAgentId?: AgentId) {
         this.store = store;
+        this.rootAgentId =
+            rootAgentId ?? store.registerAgent({ alias: "workflow-root", role: "coordinator" }).id;
     }
 
     async spawn(request: SpawnAgentRequest): Promise<SpawnAgentResult> {
@@ -31,6 +34,7 @@ class FakeSupervisor implements WorkflowSupervisor {
             let agent = this.store.registerAgent({
                 alias: request.alias,
                 role: request.role,
+                parentAgentId: this.rootAgentId,
                 ...(request.displayName === undefined ? {} : { displayName: request.displayName }),
                 ...(request.metadata === undefined ? {} : { metadata: request.metadata }),
             });
@@ -57,7 +61,7 @@ class FakeSupervisor implements WorkflowSupervisor {
         try {
             agent = this.store.getAgent(identifier as AgentId);
         } catch {
-            agent = this.store.getAgentByAlias(identifier);
+            agent = this.store.getAgentByAlias(identifier, this.rootAgentId);
         }
         this.stopped.push(agent.id);
         if (agent.status !== "stopping") {
@@ -122,10 +126,45 @@ afterEach(() => {
 });
 
 describe("WorkflowEngine", () => {
+    test("cannot observe, schedule, or cancel another coordinator workflow", async () => {
+        const storage = openStore();
+        const firstSupervisor = new FakeSupervisor(storage);
+        const secondSupervisor = new FakeSupervisor(storage);
+        const firstEngine = new WorkflowEngine({
+            store: storage,
+            supervisor: firstSupervisor,
+            rootAgentId: firstSupervisor.rootAgentId,
+        });
+        const secondEngine = new WorkflowEngine({
+            store: storage,
+            supervisor: secondSupervisor,
+            rootAgentId: secondSupervisor.rootAgentId,
+        });
+        const workflow = pipeline(firstEngine);
+
+        assert.throws(() => secondEngine.getStatus(workflow.id), /not found/u);
+        await assert.rejects(secondEngine.cancel(workflow.id), /not found/u);
+        assert.deepEqual(await secondEngine.tick(), {
+            claimed: 0,
+            resumed: 0,
+            spawnFailures: 0,
+        });
+        assert.equal(
+            firstEngine.getStatus(workflow.id).nodes.find((node) => node.nodeId === "research")
+                ?.status,
+            "ready",
+        );
+    });
+
     test("runs a DAG in dependency order and unlocks successors on durable completion", async () => {
         const storage = openStore();
         const supervisor = new FakeSupervisor(storage);
-        const engine = new WorkflowEngine({ store: storage, supervisor, maxConcurrent: 2 });
+        const engine = new WorkflowEngine({
+            store: storage,
+            supervisor,
+            rootAgentId: supervisor.rootAgentId,
+            maxConcurrent: 2,
+        });
         const workflow = pipeline(engine);
 
         assert.deepEqual(await engine.tick(), { claimed: 1, resumed: 0, spawnFailures: 0 });
@@ -155,7 +194,12 @@ describe("WorkflowEngine", () => {
         supervisor.spawnGate = new Promise<void>((resolve) => {
             releaseGate = resolve;
         });
-        const engine = new WorkflowEngine({ store: storage, supervisor, maxConcurrent: 2 });
+        const engine = new WorkflowEngine({
+            store: storage,
+            supervisor,
+            rootAgentId: supervisor.rootAgentId,
+            maxConcurrent: 2,
+        });
         const workflow = engine.start({
             name: "bounded",
             nodes: ["one", "two", "three"].map((nodeId) => ({
@@ -194,7 +238,11 @@ describe("WorkflowEngine", () => {
     test("marks failed nodes and transitively blocks their descendants", async () => {
         const storage = openStore();
         const supervisor = new FakeSupervisor(storage);
-        const engine = new WorkflowEngine({ store: storage, supervisor });
+        const engine = new WorkflowEngine({
+            store: storage,
+            supervisor,
+            rootAgentId: supervisor.rootAgentId,
+        });
         const workflow = pipeline(engine);
         await engine.tick();
 
@@ -221,6 +269,7 @@ describe("WorkflowEngine", () => {
         const initialEngine = new WorkflowEngine({
             store: initialStore,
             supervisor: initialSupervisor,
+            rootAgentId: initialSupervisor.rootAgentId,
         });
         const workflow = pipeline(initialEngine);
         await initialEngine.tick();
@@ -229,10 +278,14 @@ describe("WorkflowEngine", () => {
         openStores.splice(openStores.indexOf(initialStore), 1);
 
         const reopenedStore = openStore(filename);
-        const restartedSupervisor = new FakeSupervisor(reopenedStore);
+        const restartedSupervisor = new FakeSupervisor(
+            reopenedStore,
+            initialSupervisor.rootAgentId,
+        );
         const restartedEngine = new WorkflowEngine({
             store: reopenedStore,
             supervisor: restartedSupervisor,
+            rootAgentId: restartedSupervisor.rootAgentId,
         });
         const result = await restartedEngine.tick();
 
@@ -244,7 +297,12 @@ describe("WorkflowEngine", () => {
     test("derives distinct stable Herdr aliases when workflows reuse a task alias", async () => {
         const storage = openStore();
         const supervisor = new FakeSupervisor(storage);
-        const engine = new WorkflowEngine({ store: storage, supervisor, maxConcurrent: 2 });
+        const engine = new WorkflowEngine({
+            store: storage,
+            supervisor,
+            rootAgentId: supervisor.rootAgentId,
+            maxConcurrent: 2,
+        });
         const task = {
             alias: "shared-worker-name-that-is-long",
             role: "worker",
@@ -270,9 +328,11 @@ describe("WorkflowEngine", () => {
 
     test("rejects relative working directories before persisting a workflow", () => {
         const storage = openStore();
+        const supervisor = new FakeSupervisor(storage);
         const engine = new WorkflowEngine({
             store: storage,
-            supervisor: new FakeSupervisor(storage),
+            supervisor,
+            rootAgentId: supervisor.rootAgentId,
         });
         assert.throws(
             () =>
@@ -292,13 +352,20 @@ describe("WorkflowEngine", () => {
                 }),
             /absolute path/u,
         );
-        assert.equal(storage.listWorkflows().items.length, 0);
+        assert.equal(
+            storage.listWorkflows({ rootAgentId: supervisor.rootAgentId }).items.length,
+            0,
+        );
     });
 
     test("cancels safely mapped running agents and pending descendants", async () => {
         const storage = openStore();
         const supervisor = new FakeSupervisor(storage);
-        const engine = new WorkflowEngine({ store: storage, supervisor });
+        const engine = new WorkflowEngine({
+            store: storage,
+            supervisor,
+            rootAgentId: supervisor.rootAgentId,
+        });
         const workflow = pipeline(engine);
         await engine.tick();
 

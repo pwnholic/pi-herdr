@@ -194,6 +194,36 @@ test("read-by-id never exposes a later queued payload ahead of FIFO ownership", 
     setupStore.close();
 });
 
+test("read-by-id never exposes a message leased by another Pi process", async () => {
+    const { runtime, context, setupStore, child, parent } = fixture();
+    const message = setupStore.enqueueMessage({
+        senderAgentId: parent.id,
+        recipientAgentId: child.id,
+        kind: "message",
+        content: "owned elsewhere",
+    }).message;
+    const [claimed] = setupStore.claimMessages({
+        recipientAgentId: child.id,
+        owner: "another-pi-process",
+        leaseMs: 60_000,
+        limit: 1,
+        messageId: message.id,
+    });
+    assert.ok(claimed);
+    setupStore.markMessageRead({
+        messageId: claimed.id,
+        recipientAgentId: child.id,
+        owner: "another-pi-process",
+        expectedRevision: claimed.revision,
+    });
+    await runtime.start(context);
+
+    await assert.rejects(runtime.readMail(message.id), /not currently readable/u);
+    assert.equal(setupStore.getMessage(message.id).leaseOwner, "another-pi-process");
+    await runtime.stop();
+    setupStore.close();
+});
+
 test("child registration exposes completion but not parent control tools", () => {
     const names: string[] = [];
     const definitions: Array<{ name: string; execute: (...args: never[]) => unknown }> = [];

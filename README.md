@@ -10,7 +10,7 @@ SQLite.
 - Direct child-to-child mail without routing through the parent model.
 - Durable at-least-once delivery with stable idempotency keys, acknowledgements, strict recipient
   FIFO, active lease heartbeats, retries, TTL, dead letters, and sender-visible receipts.
-- Coordinator namespaces with storage-enforced provenance and lifecycle/control authorization.
+- Coordinator namespaces with storage-enforced mail, lifecycle, and workflow ownership.
 - Corrective steering after Escape without killing or manually resuming the child process.
 - Mutable Herdr agent aliases with coordinated agent, pane, tab, registry, and Pi display names.
 - Restart recovery using immutable agent IDs and verified Herdr workspace/tab/pane capabilities.
@@ -120,9 +120,9 @@ Child identity variables (`PI_HERDR_AGENT_ID`, `PI_HERDR_PARENT_ID`, and related
 the supervisor and should not be supplied manually.
 
 This rewrite intentionally has one clean schema baseline. A database created by the superseded
-pre-0.1 architecture is rejected with `MIGRATION_FAILED`; archive or explicitly remove that old
-development database before starting the rewritten extension. Pi Herdr never deletes it
-automatically.
+architecture—including an earlier development copy of schema v1—is rejected with
+`MIGRATION_FAILED`; archive or explicitly remove that old development database before starting
+the rewritten extension. Pi Herdr never deletes it automatically.
 
 ## Development
 
