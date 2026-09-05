@@ -30,6 +30,7 @@ export interface MailboxPumpStore {
 export interface MailboxPumpOptions {
     readonly store: MailboxPumpStore;
     readonly recipientAgentId: AgentId;
+    readonly recipientRunId?: string;
     readonly leaseMs: number;
     readonly pollMs: number;
     readonly batchSize: number;
@@ -54,6 +55,7 @@ export interface MailboxPumpOptions {
 export class MailboxPump {
     readonly #store: MailboxPumpStore;
     readonly #recipientAgentId: AgentId;
+    readonly #recipientRunId: string | undefined;
     readonly #leaseMs: number;
     readonly #heartbeatMs: number;
     readonly #batchSize: number;
@@ -72,10 +74,12 @@ export class MailboxPump {
     readonly #readLeases = new Set<MessageId>();
     #stopped = true;
     #lastPruneAt: number | undefined;
+    #laneIndex = 0;
 
     constructor(options: MailboxPumpOptions) {
         this.#store = options.store;
         this.#recipientAgentId = options.recipientAgentId;
+        this.#recipientRunId = options.recipientRunId;
         this.#leaseMs = options.leaseMs;
         this.#heartbeatMs = Math.min(
             options.pollMs,
@@ -144,12 +148,17 @@ export class MailboxPump {
         for (let index = 0; index < maximum; index += 1) {
             const [message] = this.#store.claimMessages({
                 recipientAgentId: this.#recipientAgentId,
+                ...(this.#recipientRunId === undefined
+                    ? {}
+                    : { recipientRunId: this.#recipientRunId }),
                 owner: this.owner,
                 leaseMs: this.#leaseMs,
                 limit: 1,
+                preferredLane: (["control", "result", "ordinary"] as const)[this.#laneIndex]!,
                 ...(messageId === undefined ? {} : { messageId }),
             });
             if (message === undefined) return;
+            this.#laneIndex = (this.#laneIndex + 1) % 3;
             // Claim immediately before dispatch so a slow earlier delivery cannot expire
             // leases for payloads that have not been presented to Pi yet.
             // eslint-disable-next-line no-await-in-loop

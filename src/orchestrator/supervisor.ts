@@ -9,10 +9,10 @@ import {
     canTransitionAgent,
 } from "../domain/agent.ts";
 import { ValidationError } from "../domain/errors.ts";
-import type { Failpoint } from "../faults.ts";
 import { type AgentId, parseAgentId } from "../domain/ids.ts";
 import type { EnqueueResult } from "../domain/mailbox.ts";
 import { type JsonValue, validateAlias, validateLabel } from "../domain/validation.ts";
+import type { Failpoint } from "../faults.ts";
 import type {
     HerdrAdapter,
     HerdrAgentInspection,
@@ -72,6 +72,7 @@ const CHILD_PROTOCOL_TOOLS = [
     "agent_complete",
     "agent_mail_send",
     "agent_mail_list",
+    "agent_mail_read",
     "agent_mail_ack",
     "agent_mail_sent",
     "agent_mail_retry",
@@ -170,6 +171,7 @@ export class AgentSupervisor {
         const childArgs = this.#childPiArgs(request, sessionId, childSessionDir, displayName);
         mkdirSync(childSessionDir, { recursive: true });
         let agent = this.#store.registerAgent({
+            ...(request.runId === undefined ? {} : { runId: request.runId }),
             alias,
             displayName,
             role,
@@ -194,6 +196,7 @@ export class AgentSupervisor {
                 ...(this.#workspaceId === undefined ? {} : { workspaceId: this.#workspaceId }),
                 env: {
                     PI_HERDR_AGENT_ID: agent.id,
+                    PI_HERDR_RUN_ID: agent.runId,
                     PI_HERDR_DB: this.#config.databasePath,
                     PI_HERDR_PARENT_ID: this.#parentAgentId,
                     PI_HERDR_ROLE: role,
@@ -220,7 +223,7 @@ export class AgentSupervisor {
                 ...(signal === undefined ? {} : { signal }),
             });
             phase = "mark_running";
-            agent = this.#transitionIfPossible(agent.id, "running");
+            agent = this.#markPromptSubmitted(agent.id, "running");
             return { agent, sessionId };
         } catch (cause) {
             const orphaned =
@@ -294,7 +297,7 @@ export class AgentSupervisor {
             timeoutMs: this.#config.operationTimeoutMs,
             ...(signal === undefined ? {} : { signal }),
         });
-        return this.#transitionIfPossible(record.id, "interrupted");
+        return this.#transition(record.id, "interrupted");
     }
 
     async rename(request: RenameAgentRequest, signal?: AbortSignal): Promise<AgentRecord> {
@@ -374,7 +377,7 @@ export class AgentSupervisor {
 
     async stop(agent: AgentId | string, signal?: AbortSignal): Promise<AgentRecord> {
         const current = this.resolveAgent(agent);
-        const stopping = this.#transitionIfPossible(current.id, "stopping");
+        const stopping = this.#transition(current.id, "stopping");
         try {
             const surface = await this.#surfaceFor(stopping);
             this.#failpoint?.("herdr.close.before", { agentId: stopping.id });
@@ -384,9 +387,9 @@ export class AgentSupervisor {
             });
             this.#failpoint?.("herdr.close.after", { agentId: stopping.id });
             this.#surfaces.delete(stopping.id);
-            return this.#transitionIfPossible(stopping.id, "stopped");
+            return this.#transition(stopping.id, "stopped");
         } catch (cause) {
-            const orphaned = this.#transitionIfPossible(stopping.id, "orphaned");
+            const orphaned = this.#transition(stopping.id, "orphaned");
             throw new OrchestratorError(
                 "EXTERNAL_OPERATION_FAILED",
                 `Failed to stop agent ${current.alias}: ${errorMessage(cause)}`,
@@ -419,6 +422,19 @@ export class AgentSupervisor {
             });
         }
 
+        const pendingCompletion = this.#store.getCompletion(current.id);
+        if (
+            pendingCompletion?.runId === current.runId &&
+            ["emitted", "parent_applied"].includes(pendingCompletion.state)
+        ) {
+            throw new OrchestratorError(
+                "NOT_READY",
+                "Completion is awaiting parent acknowledgement; retry resume after it is processed",
+                {
+                    details: { agentId: current.id, completionState: pendingCompletion.state },
+                },
+            );
+        }
         const oldSurface = persistedSurface(current.metadata);
         if (!oldSurface) {
             throw new OrchestratorError("RECOVERY_FAILED", "Agent working directory is unknown", {
@@ -426,7 +442,7 @@ export class AgentSupervisor {
             });
         }
         const sessionFile = this.#validateSession(current, oldSurface.cwd);
-        let agent = this.#transitionIfPossible(current.id, "starting");
+        let agent = this.#transition(current.id, "starting");
         let surface: HerdrOwnedSurface | undefined;
         let phase: AgentLifecyclePhase = "resume_create_surface";
         try {
@@ -437,6 +453,7 @@ export class AgentSupervisor {
                 ...(this.#workspaceId === undefined ? {} : { workspaceId: this.#workspaceId }),
                 env: {
                     PI_HERDR_AGENT_ID: agent.id,
+                    PI_HERDR_RUN_ID: agent.runId,
                     PI_HERDR_DB: this.#config.databasePath,
                     PI_HERDR_PARENT_ID: this.#parentAgentId,
                     PI_HERDR_ROLE: agent.role,
@@ -474,10 +491,10 @@ export class AgentSupervisor {
                     ...(signal === undefined ? {} : { signal }),
                 });
                 phase = "mark_resumed";
-                return this.#transitionIfPossible(agent.id, "running");
+                return this.#markPromptSubmitted(agent.id, "running");
             }
             phase = "mark_resumed";
-            return this.#transitionIfPossible(agent.id, "idle");
+            return this.#markPromptSubmitted(agent.id, "idle");
         } catch (cause) {
             const orphaned =
                 surface === undefined ? false : !(await this.#closeAfterFailure(surface));
@@ -504,7 +521,7 @@ export class AgentSupervisor {
                 if (!LIVE_STATUSES.has(agent.status)) continue;
                 const snapshot = persistedSurface(agent.metadata);
                 if (!snapshot) {
-                    const marked = this.#transitionIfPossible(agent.id, "orphaned");
+                    const marked = this.#transition(agent.id, "orphaned");
                     entries.push({
                         agentId: agent.id,
                         recovered: false,
@@ -533,7 +550,7 @@ export class AgentSupervisor {
                         status: recovered.status,
                     });
                 } catch (cause) {
-                    const marked = this.#transitionIfPossible(agent.id, "orphaned");
+                    const marked = this.#transition(agent.id, "orphaned");
                     entries.push({
                         agentId: agent.id,
                         recovered: false,
@@ -696,20 +713,31 @@ export class AgentSupervisor {
         return recovered;
     }
 
-    #transitionIfPossible(
-        agentId: AgentId,
-        status: AgentStatus,
-        patch: AgentPatch = {},
-    ): AgentRecord {
+    #transition(agentId: AgentId, status: AgentStatus, patch: AgentPatch = {}): AgentRecord {
         const current = this.#store.getAgent(agentId);
         if (current.status === status) return current;
-        if (!canTransitionAgent(current.status, status)) return current;
         return this.#store.transitionAgent({
             agentId,
             status,
             patch,
             expectedRevision: current.revision,
         });
+    }
+
+    #markPromptSubmitted(agentId: AgentId, status: "running" | "idle"): AgentRecord {
+        const current = this.#store.getAgent(agentId);
+        if (current.status !== "starting" && current.status !== status) {
+            // A child can settle while the native prompt command is returning.
+            this.#store.recordEvent({
+                rootAgentId: current.rootAgentId,
+                entityId: agentId,
+                runId: current.runId,
+                type: "agent.late_prompt_receipt",
+                data: { current: current.status, observed: status },
+            });
+            return current;
+        }
+        return this.#transition(agentId, status);
     }
 
     #applyInspection(agentId: AgentId, inspection: HerdrAgentInspection): AgentRecord {
@@ -721,9 +749,21 @@ export class AgentSupervisor {
                   : inspection.status === "idle" || inspection.status === "done"
                     ? "idle"
                     : undefined;
-        return target === undefined
-            ? this.#transitionIfPossible(agentId, "orphaned")
-            : this.#transitionIfPossible(agentId, target);
+        const current = this.#store.getAgent(agentId);
+        const observed = target ?? "orphaned";
+        if (current.status !== observed && !canTransitionAgent(current.status, observed)) {
+            // Native idle/done is an observation, not authority to reverse an
+            // interrupted turn, a stop in flight, or a committed completion.
+            this.#store.recordEvent({
+                rootAgentId: current.rootAgentId,
+                entityId: agentId,
+                runId: current.runId,
+                type: "agent.observation_ignored",
+                data: { current: current.status, observed },
+            });
+            return current;
+        }
+        return this.#transition(agentId, observed);
     }
 
     async #closeAfterFailure(surface: HerdrOwnedSurface): Promise<boolean> {

@@ -82,7 +82,11 @@ export function validatePageLimit(value: unknown): number {
     return validatePositiveInteger(value ?? 50, "limit", MAX_PAGE_SIZE);
 }
 
-export function assertJsonValue(value: unknown, field: string): asserts value is JsonValue {
+export function assertJsonValue(
+    value: unknown,
+    field: string,
+    maximumBytes = MAX_METADATA_BYTES,
+): asserts value is JsonValue {
     let serialized: string | undefined;
     try {
         serialized = JSON.stringify(value);
@@ -95,11 +99,10 @@ export function assertJsonValue(value: unknown, field: string): asserts value is
     if (serialized === undefined) {
         throw new ValidationError(`${field} must be a JSON value`, { field });
     }
-    if (Buffer.byteLength(serialized, "utf8") > MAX_METADATA_BYTES) {
-        throw new ValidationError(`${field} exceeds ${MAX_METADATA_BYTES} bytes`, { field });
+    if (Buffer.byteLength(serialized, "utf8") > maximumBytes) {
+        throw new ValidationError(`${field} exceeds ${maximumBytes} bytes`, { field });
     }
-    const parsed = JSON.parse(serialized) as unknown;
-    if (!isJsonValue(parsed)) {
+    if (!isJsonValue(value)) {
         throw new ValidationError(`${field} contains an unsupported JSON value`, { field });
     }
 }
@@ -109,5 +112,7 @@ function isJsonValue(value: unknown): value is JsonValue {
     if (typeof value === "number") return Number.isFinite(value);
     if (Array.isArray(value)) return value.every(isJsonValue);
     if (typeof value !== "object") return false;
+    if (Object.getPrototypeOf(value) !== Object.prototype && Object.getPrototypeOf(value) !== null)
+        return false;
     return Object.entries(value).every(([key, item]) => key.length > 0 && isJsonValue(item));
 }

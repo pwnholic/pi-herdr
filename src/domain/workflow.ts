@@ -1,4 +1,4 @@
-import type { WorkflowId } from "./ids.ts";
+import type { AgentId, WorkflowId } from "./ids.ts";
 import type { JsonValue } from "./validation.ts";
 
 export const WORKFLOW_STATUSES = [
@@ -38,6 +38,8 @@ export interface WorkflowNodeRecord {
 
 export interface WorkflowRecord {
     readonly id: WorkflowId;
+    readonly rootAgentId: AgentId;
+    readonly cancelRequestedAt?: number;
     readonly name: string;
     readonly status: WorkflowStatus;
     readonly metadata: JsonValue;
@@ -55,6 +57,7 @@ export interface CreateWorkflowNodeInput {
 
 export interface CreateWorkflowInput {
     readonly id?: WorkflowId;
+    readonly rootAgentId: AgentId;
     readonly name: string;
     readonly metadata?: JsonValue;
     readonly nodes: readonly CreateWorkflowNodeInput[];

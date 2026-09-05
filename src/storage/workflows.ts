@@ -5,9 +5,16 @@ import {
     RevisionConflictError,
     ValidationError,
 } from "../domain/errors.ts";
-import { createWorkflowId, parseWorkflowId, type WorkflowId } from "../domain/ids.ts";
+import {
+    type AgentId,
+    createWorkflowId,
+    parseAgentId,
+    parseWorkflowId,
+    type WorkflowId,
+} from "../domain/ids.ts";
 import {
     assertJsonValue,
+    MAX_MESSAGE_BYTES,
     validateLabel,
     validateNonNegativeInteger,
     validatePageLimit,
@@ -42,18 +49,22 @@ interface CountRow {
 }
 
 export interface ListWorkflowsOptions {
+    readonly rootAgentId: AgentId;
     readonly status?: WorkflowStatus;
+    readonly cancelRequestedOnly?: boolean;
     readonly limit?: number;
     readonly cursor?: string;
 }
 
 export interface TransitionWorkflowInput {
+    readonly rootAgentId: AgentId;
     readonly workflowId: WorkflowId;
     readonly status: WorkflowStatus;
     readonly expectedRevision: number;
 }
 
 export interface UpdateWorkflowNodeInput {
+    readonly rootAgentId: AgentId;
     readonly workflowId: WorkflowId;
     readonly nodeId: string;
     readonly patch: WorkflowNodePatch;
@@ -87,6 +98,8 @@ export class WorkflowRepository {
 
     create(input: CreateWorkflowInput): WorkflowRecord {
         const id = input.id === undefined ? createWorkflowId() : parseWorkflowId(input.id);
+        const rootAgentId = parseAgentId(input.rootAgentId);
+        this.#assertRootAgent(rootAgentId);
         const name = validateLabel(input.name, "name");
         const metadata = input.metadata ?? {};
         assertJsonValue(metadata, "metadata");
@@ -141,14 +154,34 @@ export class WorkflowRepository {
                 .transaction(() => {
                     this.#storage.connection
                         .prepare(`
-                        INSERT INTO workflows(id, name, status, metadata_json, created_at, updated_at, revision)
-                        VALUES (?, ?, 'pending', ?, ?, ?, 0)
+                            INSERT INTO
+                                workflows (
+                                    id,
+                                    root_agent_id,
+                                    name,
+                                    status,
+                                    metadata_json,
+                                    created_at,
+                                    updated_at,
+                                    revision
+                                )
+                            VALUES
+                                (?, ?, ?, 'pending', ?, ?, ?, 0)
                     `)
-                        .run(id, name, canonicalJson(metadata), now, now);
+                        .run(id, rootAgentId, name, canonicalJson(metadata), now, now);
                     const insertNode = this.#storage.connection.prepare(`
-                    INSERT INTO workflow_nodes(
-                        workflow_id, node_id, status, input_json, created_at, updated_at, revision
-                    ) VALUES (?, ?, ?, ?, ?, ?, 0)
+                        INSERT INTO
+                            workflow_nodes (
+                                workflow_id,
+                                node_id,
+                                status,
+                                input_json,
+                                created_at,
+                                updated_at,
+                                revision
+                            )
+                        VALUES
+                            (?, ?, ?, ?, ?, ?, 0)
                 `);
                     for (const node of normalized) {
                         insertNode.run(
@@ -181,12 +214,13 @@ export class WorkflowRepository {
             }
             throw cause;
         }
-        return this.get(id);
+        return this.get(id, rootAgentId);
     }
 
-    get(workflowId: WorkflowId): WorkflowRecord {
+    get(workflowId: WorkflowId, rootAgentId: AgentId): WorkflowRecord {
         const id = parseWorkflowId(workflowId);
-        const workflow = this.#getWorkflowRow(id);
+        const root = parseAgentId(rootAgentId);
+        const workflow = this.#getWorkflowRow(id, root);
         const nodeRows = this.#storage.connection
             .prepare("SELECT * FROM workflow_nodes WHERE workflow_id = ? ORDER BY node_id")
             .all(id) as WorkflowNodeRow[];
@@ -197,11 +231,13 @@ export class WorkflowRepository {
         );
     }
 
-    list(options: ListWorkflowsOptions = {}): WorkflowPage {
+    list(options: ListWorkflowsOptions): WorkflowPage {
         const limit = validatePageLimit(options.limit);
         const cursor = decodeCursor(options.cursor, "workflows");
-        const conditions: string[] = [];
-        const parameters: unknown[] = [];
+        const rootAgentId = parseAgentId(options.rootAgentId);
+        const conditions: string[] = ["root_agent_id = ?"];
+        const parameters: unknown[] = [rootAgentId];
+        if (options.cancelRequestedOnly) conditions.push("cancel_requested_at IS NOT NULL");
         if (options.status !== undefined) {
             if (!isWorkflowStatus(options.status))
                 throw new ValidationError("status is invalid", { field: "status" });
@@ -221,7 +257,7 @@ export class WorkflowRepository {
         const pageRows = rows.slice(0, limit);
         const last = pageRows.at(-1);
         return {
-            items: pageRows.map((row) => this.get(row.id as WorkflowId)),
+            items: pageRows.map((row) => this.get(row.id as WorkflowId, rootAgentId)),
             ...(hasMore && last
                 ? { nextCursor: encodeCursor("workflows", last.created_at, last.id) }
                 : {}),
@@ -230,10 +266,16 @@ export class WorkflowRepository {
 
     transition(input: TransitionWorkflowInput): WorkflowRecord {
         const id = parseWorkflowId(input.workflowId);
+        const rootAgentId = parseAgentId(input.rootAgentId);
         const expected = validateNonNegativeInteger(input.expectedRevision, "expectedRevision");
         if (!isWorkflowStatus(input.status))
             throw new ValidationError("status is invalid", { field: "status" });
-        const current = this.#getWorkflowRow(id);
+        const current = this.#getWorkflowRow(id, rootAgentId);
+        if (current.cancel_requested_at !== null && input.status !== "cancelled") {
+            throw new ValidationError(
+                "Cancelled workflow cannot be restarted; create a new workflow",
+            );
+        }
         if (current.revision !== expected) {
             throw new RevisionConflictError("workflow", id, expected, current.revision);
         }
@@ -243,22 +285,32 @@ export class WorkflowRepository {
         const now = this.#storage.now();
         const result = this.#storage.connection
             .prepare(`
-                UPDATE workflows SET status = ?, updated_at = ?, revision = revision + 1
-                WHERE id = ? AND revision = ?
+                UPDATE workflows
+                SET
+                    status = ?,
+                    updated_at = ?,
+                    revision = revision + 1
+                WHERE
+                    id = ?
+                    AND root_agent_id = ?
+                    AND revision = ?
             `)
-            .run(input.status, now, id, expected);
-        if (result.changes !== 1) this.#throwWorkflowRevision(id, expected);
-        return this.get(id);
+            .run(input.status, now, id, rootAgentId, expected);
+        if (result.changes !== 1) this.#throwWorkflowRevision(id, rootAgentId, expected);
+        return this.get(id, rootAgentId);
     }
 
     updateNode(input: UpdateWorkflowNodeInput): WorkflowRecord {
         const workflowId = parseWorkflowId(input.workflowId);
+        const rootAgentId = parseAgentId(input.rootAgentId);
+        this.#getWorkflowRow(workflowId, rootAgentId);
         const nodeId = this.#validateNodeId(input.nodeId);
         const expected = validateNonNegativeInteger(input.expectedRevision, "expectedRevision");
         if (!isWorkflowNodeStatus(input.patch.status)) {
             throw new ValidationError("node status is invalid", { field: "patch.status" });
         }
-        if (input.patch.output !== undefined) assertJsonValue(input.patch.output, "patch.output");
+        if (input.patch.output !== undefined)
+            assertJsonValue(input.patch.output, "patch.output", MAX_MESSAGE_BYTES + 4096);
         const error =
             input.patch.error === undefined
                 ? undefined
@@ -267,6 +319,10 @@ export class WorkflowRepository {
 
         this.#storage.connection
             .transaction(() => {
+                const workflow = this.#getWorkflowRow(workflowId, rootAgentId);
+                if (workflow.cancel_requested_at !== null && input.patch.status !== "cancelled") {
+                    throw new ValidationError("Workflow cancellation is pending");
+                }
                 const current = this.#getNodeRow(workflowId, nodeId);
                 if (current.revision !== expected) {
                     throw new RevisionConflictError(
@@ -302,10 +358,19 @@ export class WorkflowRepository {
                     : null;
                 const result = this.#storage.connection
                     .prepare(`
-                    UPDATE workflow_nodes
-                    SET status = ?, output_json = ?, error = ?, started_at = ?, finished_at = ?,
-                        updated_at = ?, revision = revision + 1
-                    WHERE workflow_id = ? AND node_id = ? AND revision = ?
+                        UPDATE workflow_nodes
+                        SET
+                            status = ?,
+                            output_json = ?,
+                            error = ?,
+                            started_at = ?,
+                            finished_at = ?,
+                            updated_at = ?,
+                            revision = revision + 1
+                        WHERE
+                            workflow_id = ?
+                            AND node_id = ?
+                            AND revision = ?
                 `)
                     .run(
                         input.patch.status,
@@ -330,7 +395,28 @@ export class WorkflowRepository {
                 this.#recompute(workflowId, now);
             })
             .immediate();
-        return this.get(workflowId);
+        return this.get(workflowId, rootAgentId);
+    }
+
+    requestCancellation(workflowId: WorkflowId, rootAgentId: AgentId): WorkflowRecord {
+        const current = this.get(workflowId, rootAgentId);
+        if (current.cancelRequestedAt === undefined && current.status !== "succeeded") {
+            const now = this.#storage.now();
+            this.#storage.connection
+                .prepare(`
+                    UPDATE workflows
+                    SET
+                        cancel_requested_at = ?,
+                        updated_at = ?,
+                        revision = revision + 1
+                    WHERE
+                        id = ?
+                        AND root_agent_id = ?
+                        AND cancel_requested_at IS NULL
+            `)
+                .run(now, now, current.id, current.rootAgentId);
+        }
+        return this.get(workflowId, rootAgentId);
     }
 
     #recompute(workflowId: WorkflowId, now: number): void {
@@ -339,15 +425,25 @@ export class WorkflowRepository {
             changes = this.#storage.connection
                 .prepare(`
                     UPDATE workflow_nodes AS node
-                    SET status = 'blocked', updated_at = ?, revision = revision + 1
-                    WHERE workflow_id = ? AND status IN ('pending','ready')
-                      AND EXISTS (
-                        SELECT 1 FROM workflow_node_dependencies dep
-                        JOIN workflow_nodes parent
-                          ON parent.workflow_id = dep.workflow_id AND parent.node_id = dep.depends_on_node_id
-                        WHERE dep.workflow_id = node.workflow_id AND dep.node_id = node.node_id
-                          AND parent.status IN ('failed','cancelled','blocked')
-                      )
+                    SET
+                        status = 'blocked',
+                        updated_at = ?,
+                        revision = revision + 1
+                    WHERE
+                        workflow_id = ?
+                        AND status IN ('pending', 'ready')
+                        AND EXISTS (
+                            SELECT
+                                1
+                            FROM
+                                workflow_node_dependencies dep
+                                JOIN workflow_nodes parent ON parent.workflow_id = dep.workflow_id
+                                AND parent.node_id = dep.depends_on_node_id
+                            WHERE
+                                dep.workflow_id = node.workflow_id
+                                AND dep.node_id = node.node_id
+                                AND parent.status IN ('failed', 'cancelled', 'blocked')
+                        )
                 `)
                 .run(now, workflowId).changes;
         } while (changes > 0);
@@ -355,15 +451,25 @@ export class WorkflowRepository {
         this.#storage.connection
             .prepare(`
                 UPDATE workflow_nodes AS node
-                SET status = 'ready', updated_at = ?, revision = revision + 1
-                WHERE workflow_id = ? AND status = 'pending'
-                  AND NOT EXISTS (
-                    SELECT 1 FROM workflow_node_dependencies dep
-                    JOIN workflow_nodes parent
-                      ON parent.workflow_id = dep.workflow_id AND parent.node_id = dep.depends_on_node_id
-                    WHERE dep.workflow_id = node.workflow_id AND dep.node_id = node.node_id
-                      AND parent.status != 'succeeded'
-                  )
+                SET
+                    status = 'ready',
+                    updated_at = ?,
+                    revision = revision + 1
+                WHERE
+                    workflow_id = ?
+                    AND status = 'pending'
+                    AND NOT EXISTS (
+                        SELECT
+                            1
+                        FROM
+                            workflow_node_dependencies dep
+                            JOIN workflow_nodes parent ON parent.workflow_id = dep.workflow_id
+                            AND parent.node_id = dep.depends_on_node_id
+                        WHERE
+                            dep.workflow_id = node.workflow_id
+                            AND dep.node_id = node.node_id
+                            AND parent.status != 'succeeded'
+                    )
             `)
             .run(now, workflowId);
 
@@ -398,11 +504,16 @@ export class WorkflowRepository {
     #dependenciesSucceeded(workflowId: WorkflowId, nodeId: string): boolean {
         const row = this.#storage.connection
             .prepare(`
-                SELECT COUNT(*) AS count
-                FROM workflow_node_dependencies dep
-                JOIN workflow_nodes parent
-                  ON parent.workflow_id = dep.workflow_id AND parent.node_id = dep.depends_on_node_id
-                WHERE dep.workflow_id = ? AND dep.node_id = ? AND parent.status != 'succeeded'
+                SELECT
+                    COUNT(*) AS count
+                FROM
+                    workflow_node_dependencies dep
+                    JOIN workflow_nodes parent ON parent.workflow_id = dep.workflow_id
+                    AND parent.node_id = dep.depends_on_node_id
+                WHERE
+                    dep.workflow_id = ?
+                    AND dep.node_id = ?
+                    AND parent.status != 'succeeded'
             `)
             .get(workflowId, nodeId) as CountRow;
         return row.count === 0;
@@ -458,12 +569,21 @@ export class WorkflowRepository {
         return value;
     }
 
-    #getWorkflowRow(workflowId: WorkflowId): WorkflowRow {
+    #getWorkflowRow(workflowId: WorkflowId, rootAgentId: AgentId): WorkflowRow {
         const row = this.#storage.connection
-            .prepare("SELECT * FROM workflows WHERE id = ?")
-            .get(workflowId) as WorkflowRow | undefined;
+            .prepare("SELECT * FROM workflows WHERE id = ? AND root_agent_id = ?")
+            .get(workflowId, rootAgentId) as WorkflowRow | undefined;
         if (!row) throw new NotFoundError("workflow", workflowId);
         return row;
+    }
+
+    #assertRootAgent(rootAgentId: AgentId): void {
+        const row = this.#storage.connection
+            .prepare(
+                "SELECT id FROM agents WHERE id = ? AND root_agent_id = id AND parent_agent_id IS NULL",
+            )
+            .get(rootAgentId) as { readonly id: string } | undefined;
+        if (row === undefined) throw new NotFoundError("root_agent", rootAgentId);
     }
 
     #getNodeRow(workflowId: WorkflowId, nodeId: string): WorkflowNodeRow {
@@ -474,8 +594,8 @@ export class WorkflowRepository {
         return row;
     }
 
-    #throwWorkflowRevision(workflowId: WorkflowId, expected: number): never {
-        const actual = this.#getWorkflowRow(workflowId).revision;
+    #throwWorkflowRevision(workflowId: WorkflowId, rootAgentId: AgentId, expected: number): never {
+        const actual = this.#getWorkflowRow(workflowId, rootAgentId).revision;
         throw new RevisionConflictError("workflow", workflowId, expected, actual);
     }
 }

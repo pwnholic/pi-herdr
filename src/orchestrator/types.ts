@@ -4,6 +4,8 @@ import type { EnqueueResult, MessageKind } from "../domain/mailbox.ts";
 import type { JsonValue } from "../domain/validation.ts";
 
 export interface SpawnAgentRequest {
+    /** Internal scheduler reservation; not a public tool parameter. */
+    readonly runId?: string;
     readonly alias: string;
     readonly displayName?: string;
     readonly role: string;

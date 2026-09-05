@@ -1,4 +1,6 @@
+import { createHash } from "node:crypto";
 import type { AgentPage, AgentRecord, RegisterAgentInput } from "../domain/agent.ts";
+import { ValidationError } from "../domain/errors.ts";
 import type { AgentId, MessageId, WorkflowId } from "../domain/ids.ts";
 import type {
     EnqueueMessageInput,
@@ -25,6 +27,8 @@ import {
     type MailboxEffectState,
 } from "./completions.ts";
 import { type Clock, type OpenStoreOptions, StorageDatabase } from "./database.ts";
+import { type EventQuery, EventRepository } from "./events.ts";
+import { canonicalJson } from "./json.ts";
 import {
     type ClaimMessagesInput,
     type DeadLetterMessageInput,
@@ -84,6 +88,7 @@ export class SqliteControlPlaneStore {
     readonly #mailbox: MailboxRepository;
     readonly #completions: CompletionRepository;
     readonly #workflows: WorkflowRepository;
+    readonly #events: EventRepository;
 
     private constructor(options: OpenStoreOptions) {
         this.#database = new StorageDatabase(options);
@@ -91,6 +96,7 @@ export class SqliteControlPlaneStore {
         this.#mailbox = new MailboxRepository(this.#database);
         this.#completions = new CompletionRepository(this.#database);
         this.#workflows = new WorkflowRepository(this.#database);
+        this.#events = new EventRepository(this.#database);
     }
 
     static open(options: OpenStoreOptions): SqliteControlPlaneStore {
@@ -99,6 +105,33 @@ export class SqliteControlPlaneStore {
 
     close(): void {
         this.#database.close();
+    }
+
+    listEvents(input: EventQuery) {
+        return this.#events.list(input);
+    }
+
+    recordEvent(input: Parameters<EventRepository["append"]>[0]): void {
+        this.#events.append(input);
+    }
+
+    databaseHealth() {
+        const db = this.#database.connection;
+        return {
+            schema: db
+                .prepare("SELECT version, name FROM schema_migrations ORDER BY version")
+                .all(),
+            journalMode: db.pragma("journal_mode", { simple: true }),
+            foreignKeys: db.pragma("foreign_keys", { simple: true }) === 1,
+            quickCheck: db.pragma("quick_check(1)", { simple: true }),
+            allocatedBytes:
+                Number(db.pragma("page_count", { simple: true })) *
+                Number(db.pragma("page_size", { simple: true })),
+        };
+    }
+
+    requestWorkflowCancellation(workflowId: WorkflowId, rootAgentId: AgentId): WorkflowRecord {
+        return this.#workflows.requestCancellation(workflowId, rootAgentId);
     }
 
     registerAgent(input: RegisterAgentInput): AgentRecord {
@@ -206,6 +239,7 @@ export class SqliteControlPlaneStore {
     }
 
     pruneMailbox(input: PruneMessagesInput): PruneMessagesResult {
+        this.#events.prune(input.retentionMs, input.limit);
         return this.#mailbox.prune(input);
     }
 
@@ -215,6 +249,69 @@ export class SqliteControlPlaneStore {
 
     declareCompletion(input: DeclareCompletionInput): CompletionOutboxRecord {
         return this.#completions.declare(input);
+    }
+
+    /** Frozen declaration, mailbox envelope, and publication marker commit together. */
+    publishCompletion(agentId: AgentId, runId: string, token: string): MailboxMessage {
+        return this.#database.connection
+            .transaction(() => {
+                const agent = this.#agents.get(agentId);
+                const declaration = this.#completions.get(agentId);
+                if (
+                    agent.runId !== runId ||
+                    declaration?.runId !== runId ||
+                    declaration.invocationToken !== token ||
+                    agent.parentAgentId === undefined
+                ) {
+                    throw new ValidationError(
+                        "Completion does not belong to the active assignment",
+                    );
+                }
+                if (declaration.messageId !== undefined && declaration.state !== "invalidated") {
+                    return this.#mailbox.get(declaration.messageId);
+                }
+                if (declaration.state !== "declared")
+                    throw new ValidationError("Completion is not declared");
+                const payload = declaration.payload as { status?: unknown };
+                if (payload.status !== "succeeded" && payload.status !== "failed")
+                    throw new ValidationError("Invalid completion status");
+                if (
+                    payload.status === "succeeded" &&
+                    this.#mailbox.unresolvedRequired(agent.id).length > 0
+                ) {
+                    throw new ValidationError(
+                        "Cannot publish completion with unresolved required mail",
+                    );
+                }
+                const delivery = this.#mailbox.enqueue({
+                    senderAgentId: agent.id,
+                    senderRunId: runId,
+                    recipientAgentId: agent.parentAgentId,
+                    kind: "result",
+                    content: canonicalJson(declaration.payload),
+                    metadata: {
+                        action: "completion",
+                        agentId,
+                        runId,
+                        status: payload.status,
+                        completionToken: token,
+                    },
+                    idempotencyKey: `completion:${createHash("sha256").update(`${agentId}:${runId}:${token}`).digest("hex")}`,
+                });
+                this.#database.hit("completion.publish.after_enqueue", { agentId, runId });
+                this.#completions.markEmitted(agentId, token, delivery.message.id);
+                const status = payload.status === "succeeded" ? "completed" : "failed";
+                if (agent.status !== status)
+                    this.#agents.transition({
+                        agentId,
+                        status,
+                        expectedRevision: agent.revision,
+                        patch: {},
+                    });
+                this.#database.hit("completion.publish.before_commit", { agentId, runId });
+                return delivery.message;
+            })
+            .immediate();
     }
 
     markCompletionEmitted(
@@ -257,11 +354,11 @@ export class SqliteControlPlaneStore {
         return this.#workflows.create(input);
     }
 
-    getWorkflow(workflowId: WorkflowId): WorkflowRecord {
-        return this.#workflows.get(workflowId);
+    getWorkflow(workflowId: WorkflowId, rootAgentId: AgentId): WorkflowRecord {
+        return this.#workflows.get(workflowId, rootAgentId);
     }
 
-    listWorkflows(options?: ListWorkflowsOptions): WorkflowPage {
+    listWorkflows(options: ListWorkflowsOptions): WorkflowPage {
         return this.#workflows.list(options);
     }
 

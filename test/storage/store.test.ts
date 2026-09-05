@@ -73,7 +73,7 @@ describe("durable agent registry", () => {
               name TEXT NOT NULL UNIQUE,
               applied_at INTEGER NOT NULL
             ) STRICT;
-            INSERT INTO schema_migrations VALUES (1, 'durable-agent-registry-and-mailbox', 1);
+            INSERT INTO schema_migrations VALUES (1, 'pi-herdr-control-plane-v1', 1);
         `);
         legacy.close();
         assert.throws(
@@ -765,11 +765,56 @@ describe("durable mailbox", () => {
 });
 
 describe("durable workflows", () => {
-    test("rejects duplicate nodes, unknown dependencies, and DAG cycles", () => {
+    test("isolates workflow ownership between coordinator namespaces", () => {
         const { store } = fixture();
+        const firstRoot = store.registerAgent({ alias: "first-root", role: "coordinator" });
+        const secondRoot = store.registerAgent({ alias: "second-root", role: "coordinator" });
+        const child = store.registerAgent({
+            alias: "first-child",
+            role: "worker",
+            parentAgentId: firstRoot.id,
+        });
+        const workflow = store.createWorkflow({
+            rootAgentId: firstRoot.id,
+            name: "private",
+            nodes: [{ nodeId: "work" }],
+        });
+
+        assert.equal(workflow.rootAgentId, firstRoot.id);
+        assert.equal(store.listWorkflows({ rootAgentId: firstRoot.id }).items.length, 1);
+        assert.equal(store.listWorkflows({ rootAgentId: secondRoot.id }).items.length, 0);
+        assert.throws(() => store.getWorkflow(workflow.id, secondRoot.id), expectCode("NOT_FOUND"));
+        assert.throws(
+            () =>
+                store.updateWorkflowNode({
+                    rootAgentId: secondRoot.id,
+                    workflowId: workflow.id,
+                    nodeId: "work",
+                    patch: { status: "running" },
+                    expectedRevision: workflow.nodes[0]?.revision ?? 0,
+                }),
+            expectCode("NOT_FOUND"),
+        );
         assert.throws(
             () =>
                 store.createWorkflow({
+                    rootAgentId: child.id,
+                    name: "child-owned",
+                    nodes: [{ nodeId: "work" }],
+                }),
+            expectCode("NOT_FOUND"),
+        );
+        assert.equal(store.getWorkflow(workflow.id, firstRoot.id).nodes[0]?.status, "ready");
+        store.close();
+    });
+
+    test("rejects duplicate nodes, unknown dependencies, and DAG cycles", () => {
+        const { store } = fixture();
+        const rootAgentId = store.registerAgent({ alias: "workflow-root", role: "coordinator" }).id;
+        assert.throws(
+            () =>
+                store.createWorkflow({
+                    rootAgentId,
                     name: "duplicate",
                     nodes: [{ nodeId: "a" }, { nodeId: "a" }],
                 }),
@@ -778,6 +823,7 @@ describe("durable workflows", () => {
         assert.throws(
             () =>
                 store.createWorkflow({
+                    rootAgentId,
                     name: "unknown",
                     nodes: [{ nodeId: "a", dependencies: ["missing"] }],
                 }),
@@ -786,6 +832,7 @@ describe("durable workflows", () => {
         assert.throws(
             () =>
                 store.createWorkflow({
+                    rootAgentId,
                     name: "cycle",
                     nodes: [
                         { nodeId: "a", dependencies: ["b"] },
@@ -799,7 +846,9 @@ describe("durable workflows", () => {
 
     test("atomically advances dependencies and recomputes terminal parent status", () => {
         const { store } = fixture();
+        const rootAgentId = store.registerAgent({ alias: "workflow-root", role: "coordinator" }).id;
         let workflow = store.createWorkflow({
+            rootAgentId,
             name: "pipeline",
             nodes: [{ nodeId: "research" }, { nodeId: "implement", dependencies: ["research"] }],
         });
@@ -809,6 +858,7 @@ describe("durable workflows", () => {
 
         const research = workflow.nodes.find((node) => node.nodeId === "research")!;
         workflow = store.updateWorkflowNode({
+            rootAgentId,
             workflowId: workflow.id,
             nodeId: research.nodeId,
             patch: { status: "running" },
@@ -818,6 +868,7 @@ describe("durable workflows", () => {
         assert.throws(
             () =>
                 store.updateWorkflowNode({
+                    rootAgentId,
                     workflowId: workflow.id,
                     nodeId: "research",
                     patch: { status: "succeeded" },
@@ -826,6 +877,7 @@ describe("durable workflows", () => {
             expectCode("REVISION_CONFLICT"),
         );
         workflow = store.updateWorkflowNode({
+            rootAgentId,
             workflowId: workflow.id,
             nodeId: "research",
             patch: { status: "succeeded", output: { finding: "ok" } },
@@ -834,6 +886,7 @@ describe("durable workflows", () => {
         assert.equal(workflow.nodes.find((node) => node.nodeId === "implement")?.status, "ready");
         const implement = workflow.nodes.find((node) => node.nodeId === "implement")!;
         workflow = store.updateWorkflowNode({
+            rootAgentId,
             workflowId: workflow.id,
             nodeId: "implement",
             patch: { status: "running" },
@@ -841,6 +894,7 @@ describe("durable workflows", () => {
         });
         const runningImplement = workflow.nodes.find((node) => node.nodeId === "implement")!;
         workflow = store.updateWorkflowNode({
+            rootAgentId,
             workflowId: workflow.id,
             nodeId: "implement",
             patch: { status: "succeeded" },
@@ -856,13 +910,15 @@ describe("durable workflows", () => {
 
     test("persists workflow DAG and state across reopen", () => {
         const { filename, clock, store } = fixture();
+        const rootAgentId = store.registerAgent({ alias: "workflow-root", role: "coordinator" }).id;
         const id: WorkflowId = store.createWorkflow({
+            rootAgentId,
             name: "persistent",
             nodes: [{ nodeId: "one" }, { nodeId: "two", dependencies: ["one"] }],
         }).id;
         store.close();
         const reopened = SqliteControlPlaneStore.open({ filename, clock });
-        const recovered = reopened.getWorkflow(id);
+        const recovered = reopened.getWorkflow(id, rootAgentId);
         assert.deepEqual(recovered.nodes.find((node) => node.nodeId === "two")?.dependencies, [
             "one",
         ]);

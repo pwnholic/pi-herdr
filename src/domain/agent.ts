@@ -19,6 +19,7 @@ export type AgentStatus = (typeof AGENT_STATUSES)[number];
 
 export interface AgentRecord {
     readonly id: AgentId;
+    readonly runId: string;
     readonly alias: string;
     readonly displayName: string;
     readonly role: string;
@@ -41,6 +42,7 @@ export interface AgentRecord {
 
 export interface RegisterAgentInput {
     readonly id?: AgentId;
+    readonly runId?: string;
     readonly alias: string;
     readonly displayName?: string;
     readonly role: string;
@@ -69,8 +71,8 @@ export interface AgentPage {
 }
 
 const ALLOWED_TRANSITIONS: Readonly<Record<AgentStatus, ReadonlySet<AgentStatus>>> = {
-    registered: new Set(["starting", "stopped"]),
-    starting: new Set(["running", "idle", "blocked", "failed", "stopped", "orphaned"]),
+    registered: new Set(["starting", "stopping", "stopped"]),
+    starting: new Set(["running", "idle", "blocked", "failed", "stopping", "stopped", "orphaned"]),
     running: new Set([
         "idle",
         "blocked",
@@ -95,7 +97,7 @@ const ALLOWED_TRANSITIONS: Readonly<Record<AgentStatus, ReadonlySet<AgentStatus>
     stopped: new Set(["starting"]),
     completed: new Set(["starting"]),
     failed: new Set(["starting", "stopped"]),
-    orphaned: new Set(["starting", "running", "stopping", "stopped", "failed"]),
+    orphaned: new Set(["starting", "running", "idle", "blocked", "stopping", "stopped", "failed"]),
 };
 
 export function isAgentStatus(value: unknown): value is AgentStatus {

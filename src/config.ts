@@ -1,4 +1,5 @@
 import { isAbsolute, join, resolve } from "node:path";
+import { MAX_MESSAGE_BYTES, MAX_PAGE_SIZE } from "./domain/validation.ts";
 
 export interface OrchestratorConfig {
     readonly databasePath: string;
@@ -78,9 +79,9 @@ export function resolveConfig(context: ConfigContext): OrchestratorConfig {
             "PI_HERDR_MAX_RESULT_BYTES",
             DEFAULTS.maxResultBytes,
             1_024,
-            4 * 1024 * 1024,
+            MAX_MESSAGE_BYTES,
         ),
-        maxPageSize: integer(env, "PI_HERDR_MAX_PAGE_SIZE", DEFAULTS.maxPageSize, 1, 500),
+        maxPageSize: integer(env, "PI_HERDR_MAX_PAGE_SIZE", DEFAULTS.maxPageSize, 1, MAX_PAGE_SIZE),
         launchTimeoutMs: integer(
             env,
             "PI_HERDR_LAUNCH_TIMEOUT_MS",

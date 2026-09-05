@@ -194,6 +194,36 @@ test("read-by-id never exposes a later queued payload ahead of FIFO ownership", 
     setupStore.close();
 });
 
+test("read-by-id never exposes a message leased by another Pi process", async () => {
+    const { runtime, context, setupStore, child, parent } = fixture();
+    const message = setupStore.enqueueMessage({
+        senderAgentId: parent.id,
+        recipientAgentId: child.id,
+        kind: "message",
+        content: "owned elsewhere",
+    }).message;
+    const [claimed] = setupStore.claimMessages({
+        recipientAgentId: child.id,
+        owner: "another-pi-process",
+        leaseMs: 60_000,
+        limit: 1,
+        messageId: message.id,
+    });
+    assert.ok(claimed);
+    setupStore.markMessageRead({
+        messageId: claimed.id,
+        recipientAgentId: child.id,
+        owner: "another-pi-process",
+        expectedRevision: claimed.revision,
+    });
+    await runtime.start(context);
+
+    await assert.rejects(runtime.readMail(message.id), /not currently readable/u);
+    assert.equal(setupStore.getMessage(message.id).leaseOwner, "another-pi-process");
+    await runtime.stop();
+    setupStore.close();
+});
+
 test("child registration exposes completion but not parent control tools", () => {
     const names: string[] = [];
     const definitions: Array<{ name: string; execute: (...args: never[]) => unknown }> = [];
@@ -379,13 +409,15 @@ test("parent finalizes a result before notification and automatic acknowledgemen
         patch: {},
         expectedRevision: child.revision,
     });
-    const result = setupStore.enqueueMessage({
-        senderAgentId: child.id,
-        recipientAgentId: runtime.identity.id,
-        kind: "result",
-        content: JSON.stringify({ status: "succeeded", summary: "done" }),
-        metadata: { action: "completion", agentId: child.id, status: "succeeded" },
+    setupStore.declareCompletion({
+        agentId: child.id,
+        runId: child.runId,
+        invocationToken: "parent-result-test",
+        payload: { status: "succeeded", summary: "done" },
     });
+    const result = {
+        message: setupStore.publishCompletion(child.id, child.runId, "parent-result-test"),
+    };
 
     await assert.rejects(runtime.readMail(result.message.id));
     await new Promise((resolve) => setTimeout(resolve, 300));
@@ -396,6 +428,57 @@ test("parent finalizes a result before notification and automatic acknowledgemen
     assert.equal(setupStore.getAgent(child.id).status, "completed");
     await runtime.stop();
     setupStore.close();
+});
+
+test("completion accepts the configured result budget rather than the smaller metadata budget", async () => {
+    const { runtime, context, setupStore, child, parent } = fixture();
+    try {
+        await runtime.start(context);
+        runtime.onAgentStart();
+        assert.throws(
+            () =>
+                runtime.declareCompletion(
+                    { status: "succeeded", summary: "invalid", details: { count: Number.NaN } },
+                    "invalid",
+                ),
+            /unsupported JSON/,
+        );
+        const details = { report: "x".repeat(100000) };
+        runtime.declareCompletion(
+            { status: "succeeded", summary: "large structured result", details },
+            "large-result",
+        );
+        await runtime.onAgentSettled(context);
+        const result = setupStore.listMessages({ recipientAgentId: parent.id }).items[0]!;
+        assert.deepEqual(JSON.parse(result.content).details, details);
+        assert.equal(setupStore.getCompletion(child.id)?.state, "emitted");
+    } finally {
+        await runtime.stop();
+        setupStore.close();
+    }
+});
+
+test("a new reasoning turn invalidates a pre-correction declaration and accepts a revised result", async () => {
+    const { runtime, context, setupStore, child } = fixture();
+    try {
+        await runtime.start(context);
+        runtime.onAgentStart();
+        runtime.declareCompletion(
+            { status: "succeeded", summary: "before correction" },
+            "old-declaration",
+        );
+        runtime.onAgentStart();
+        assert.equal(setupStore.getCompletion(child.id)?.state, "invalidated");
+        runtime.declareCompletion(
+            { status: "succeeded", summary: "after correction" },
+            "new-declaration",
+        );
+        await runtime.onAgentSettled(context);
+        assert.equal(setupStore.getCompletion(child.id)?.state, "emitted");
+    } finally {
+        await runtime.stop();
+        setupStore.close();
+    }
 });
 
 test("distinct completion invocation tokens permit a later resumed assignment", async () => {
@@ -513,6 +596,101 @@ test("child discovery and direct peer mail expose a stable interaction path", as
     assert.equal(setupStore.getMessage(interaction.message.id).recipientAgentId, startingPeer.id);
     await runtime.stop();
     setupStore.close();
+});
+
+test("tools support discover, direct request, read, reply, ack and sender receipt using model-visible content", async () => {
+    const base = fixture();
+    let peer = base.setupStore.registerAgent({
+        alias: "workflow_engine",
+        role: "scheduler",
+        parentAgentId: base.parent.id,
+    });
+    peer = base.setupStore.transitionAgent({
+        agentId: peer.id,
+        status: "starting",
+        patch: {},
+        expectedRevision: peer.revision,
+    });
+    const peerRuntime = new PiHerdrRuntime(
+        {
+            setSessionName: () => undefined,
+            sendMessage: () => undefined,
+        } as unknown as ExtensionAPI,
+        {
+            extensionPath: join(base.directory, "extension.ts"),
+            environment: {
+                PI_HERDR_AGENT_ID: peer.id,
+                PI_HERDR_RUN_ID: peer.runId,
+                PI_HERDR_PARENT_ID: base.parent.id,
+                PI_HERDR_DB: base.filename,
+                PI_HERDR_COMPLETION_POLL_MS: "60000",
+            },
+        },
+    );
+    type Tool = {
+        name: string;
+        execute: (id: string, params: unknown) => Promise<{ content: Array<{ text: string }> }>;
+    };
+    const invoker = (runtime: PiHerdrRuntime) => {
+        const definitions = new Map<string, Tool>();
+        registerPiHerdrTools(
+            {
+                registerTool: (tool: Tool) => definitions.set(tool.name, tool),
+            } as unknown as ExtensionAPI,
+            runtime,
+            true,
+        );
+        return async (name: string, params: unknown): Promise<Record<string, unknown>> => {
+            const result = await definitions.get(name)!.execute(`call-${name}`, params);
+            // Intentionally never inspect details: Pi only shows content to the model.
+            return JSON.parse(result.content[0]!.text.split("\n")[1]!) as Record<string, unknown>;
+        };
+    };
+    try {
+        await base.runtime.start(base.context);
+        await peerRuntime.start(base.context);
+        const caller = invoker(base.runtime),
+            receiver = invoker(peerRuntime);
+        const directory = await caller("agent_directory", {});
+        const discovered = (directory.items as Array<{ id: string; alias: string }>).find(
+            (entry) => entry.alias === "workflow_engine",
+        )!;
+        assert.equal(discovered.id, peer.id);
+        const sent = await caller("agent_mail_send", {
+            recipient: discovered.id,
+            kind: "request",
+            content: "Confirm transaction boundary",
+            idempotencyKey: "journey-request",
+        });
+        const requestId = (sent.message as { id: string }).id;
+        assert.equal((sent.recipient as { path: string }).path, "/root/workflow_engine");
+        assert.ok((await receiver("agent_mail_list", {})).items);
+        const read = await receiver("agent_mail_read", { messageId: requestId });
+        assert.equal(read.content, "Confirm transaction boundary");
+        const reply = await receiver("agent_mail_send", {
+            recipient: base.child.id,
+            kind: "response",
+            content: "Confirmed",
+            replyToMessageId: requestId,
+        });
+        await receiver("agent_mail_ack", { messageId: requestId });
+        const replyId = (reply.message as { id: string }).id;
+        const response = await caller("agent_mail_read", { messageId: replyId });
+        assert.equal(response.content, "Confirmed");
+        assert.equal(response.threadId, read.threadId);
+        await caller("agent_mail_ack", { messageId: replyId });
+        const receipt = await caller("agent_mail_sent", {});
+        assert.equal(
+            (receipt.items as Array<{ id: string; state: string }>).find(
+                (item) => item.id === requestId,
+            )?.state,
+            "acked",
+        );
+    } finally {
+        await peerRuntime.stop();
+        await base.runtime.stop();
+        base.setupStore.close();
+    }
 });
 
 test("recovery detects a Pi-persisted injection after failure and does not duplicate it", async () => {
