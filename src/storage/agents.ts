@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import type {
     AgentPage,
     AgentPatch,
@@ -97,11 +98,48 @@ export class AgentRepository {
         try {
             this.#storage.connection
                 .prepare(`
-                    INSERT INTO agents(
-                        id, alias, display_name, role, status, session_id, session_file,
-                        workspace_id, tab_id, pane_id, parent_agent_id, root_agent_id, metadata_json,
-                        created_at, updated_at, last_seen_at, revision
-                    ) VALUES (?, ?, ?, ?, 'registered', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+                    INSERT INTO
+                        agents (
+                            id,
+                            alias,
+                            display_name,
+                            role,
+                            status,
+                            session_id,
+                            session_file,
+                            workspace_id,
+                            tab_id,
+                            pane_id,
+                            parent_agent_id,
+                            root_agent_id,
+                            metadata_json,
+                            created_at,
+                            updated_at,
+                            last_seen_at,
+                            run_id,
+                            revision
+                        )
+                    VALUES
+                        (
+                            ?,
+                            ?,
+                            ?,
+                            ?,
+                            'registered',
+                            ?,
+                            ?,
+                            ?,
+                            ?,
+                            ?,
+                            ?,
+                            ?,
+                            ?,
+                            ?,
+                            ?,
+                            ?,
+                            ?,
+                            0
+                        )
                 `)
                 .run(
                     id,
@@ -119,6 +157,7 @@ export class AgentRepository {
                     now,
                     now,
                     now,
+                    input.runId === undefined ? randomUUID() : parseAgentId(input.runId),
                 );
         } catch (cause) {
             if (isSqliteConstraintError(cause)) {
@@ -216,8 +255,15 @@ export class AgentRepository {
         try {
             const result = this.#storage.connection
                 .prepare(`
-                    UPDATE agents SET alias = ?, display_name = ?, updated_at = ?, revision = revision + 1
-                    WHERE id = ? AND revision = ?
+                    UPDATE agents
+                    SET
+                        alias = ?,
+                        display_name = ?,
+                        updated_at = ?,
+                        revision = revision + 1
+                    WHERE
+                        id = ?
+                        AND revision = ?
                 `)
                 .run(alias, displayName, now, id, expectedRevision);
             if (result.changes !== 1) this.#throwRevision(id, expectedRevision);
@@ -293,6 +339,12 @@ export class AgentRepository {
         const patch = input.patch;
         const assignments = ["status = ?"];
         const values: unknown[] = [input.status];
+        // A process restart is not a new assignment. Only reopening a finished
+        // assignment invalidates its traffic and completion declaration.
+        if (input.status === "starting" && ["completed", "failed"].includes(current.status)) {
+            assignments.push("run_id = ?");
+            values.push(randomUUID());
+        }
         const stringFields = [
             ["sessionId", "session_id", 256],
             ["sessionFile", "session_file", 4_096],
@@ -359,8 +411,18 @@ export class AgentRepository {
         const result = this.#storage.connection
             .prepare(`
                 UPDATE agents
-                SET lease_owner = ?, lease_expires_at = ?, updated_at = ?, revision = revision + 1
-                WHERE id = ? AND (lease_owner IS NULL OR lease_expires_at <= ? OR lease_owner = ?)
+                SET
+                    lease_owner = ?,
+                    lease_expires_at = ?,
+                    updated_at = ?,
+                    revision = revision + 1
+                WHERE
+                    id = ?
+                    AND (
+                        lease_owner IS NULL
+                        OR lease_expires_at <= ?
+                        OR lease_owner = ?
+                    )
             `)
             .run(owner, expiresAt, now, id, now, owner);
         if (result.changes !== 1) {
@@ -378,8 +440,14 @@ export class AgentRepository {
         const result = this.#storage.connection
             .prepare(`
                 UPDATE agents
-                SET lease_expires_at = ?, updated_at = ?, revision = revision + 1
-                WHERE id = ? AND lease_owner = ? AND lease_expires_at > ?
+                SET
+                    lease_expires_at = ?,
+                    updated_at = ?,
+                    revision = revision + 1
+                WHERE
+                    id = ?
+                    AND lease_owner = ?
+                    AND lease_expires_at > ?
             `)
             .run(now + leaseMs, now, id, owner, now);
         if (result.changes !== 1) {
@@ -396,8 +464,14 @@ export class AgentRepository {
         const result = this.#storage.connection
             .prepare(`
                 UPDATE agents
-                SET lease_owner = NULL, lease_expires_at = NULL, updated_at = ?, revision = revision + 1
-                WHERE id = ? AND lease_owner = ?
+                SET
+                    lease_owner = NULL,
+                    lease_expires_at = NULL,
+                    updated_at = ?,
+                    revision = revision + 1
+                WHERE
+                    id = ?
+                    AND lease_owner = ?
             `)
             .run(now, id, owner);
         if (result.changes !== 1) {

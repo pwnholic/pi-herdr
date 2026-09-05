@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { isAbsolute } from "node:path";
 import type { AgentRecord, AgentStatus } from "../domain/agent.ts";
 import { ControlPlaneError, ValidationError } from "../domain/errors.ts";
@@ -6,6 +6,7 @@ import { type AgentId, parseAgentId, parseWorkflowId, type WorkflowId } from "..
 import {
     assertJsonValue,
     type JsonValue,
+    MAX_MESSAGE_BYTES,
     validateAlias,
     validateLabel,
     validatePositiveInteger,
@@ -33,6 +34,7 @@ interface WorkflowEngineOptions {
 
 interface AgentBinding {
     readonly version: 1;
+    readonly runId: string;
     readonly state: "reserved" | "succeeded" | "failed";
     readonly workflowId: WorkflowId;
     readonly nodeId: string;
@@ -88,6 +90,7 @@ function reservation(workflowId: WorkflowId, nodeId: string, alias: string): Res
     return {
         piHerdr: {
             version: 1,
+            runId: randomUUID(),
             state: "reserved",
             workflowId,
             nodeId,
@@ -98,7 +101,7 @@ function reservation(workflowId: WorkflowId, nodeId: string, alias: string): Res
 }
 
 function toJsonValue(value: unknown, field: string): JsonValue {
-    assertJsonValue(value, field);
+    assertJsonValue(value, field, MAX_MESSAGE_BYTES + 4096);
     return value;
 }
 
@@ -107,6 +110,7 @@ function bindingFrom(value: JsonValue | undefined): AgentBinding | undefined {
     const binding = value.piHerdr;
     if (
         binding.version !== 1 ||
+        typeof binding.runId !== "string" ||
         !["reserved", "succeeded", "failed"].includes(String(binding.state)) ||
         typeof binding.workflowId !== "string" ||
         typeof binding.nodeId !== "string" ||
@@ -129,7 +133,8 @@ function bindingMatchesAgent(binding: AgentBinding, agent: AgentRecord): boolean
     return (
         metadata?.workflowId === binding.workflowId &&
         metadata.nodeId === binding.nodeId &&
-        metadata.spawnKey === binding.spawnKey
+        metadata.spawnKey === binding.spawnKey &&
+        agent.runId === binding.runId
     );
 }
 
@@ -260,7 +265,7 @@ export class WorkflowEngine {
                 nodeId: node.nodeId,
             });
         }
-        if (event.result !== undefined) assertJsonValue(event.result, "result");
+        if (event.result !== undefined) assertJsonValue(event.result, "result", MAX_MESSAGE_BYTES);
         return this.#store.updateWorkflowNode({
             rootAgentId: this.#rootAgentId,
             workflowId,
@@ -293,7 +298,8 @@ export class WorkflowEngine {
                 nodeId: node.nodeId,
             });
         }
-        if (event.details !== undefined) assertJsonValue(event.details, "details");
+        if (event.details !== undefined)
+            assertJsonValue(event.details, "details", MAX_MESSAGE_BYTES);
         return this.#store.updateWorkflowNode({
             rootAgentId: this.#rootAgentId,
             workflowId,
@@ -328,6 +334,17 @@ export class WorkflowEngine {
             throw new ValidationError("Agent is not assigned to a workflow node", { agentId });
         }
         const workflowId = parseWorkflowId(metadata.workflowId);
+        const workflow = this.#store.getWorkflow(workflowId, this.#rootAgentId);
+        if (workflow.cancelRequestedAt !== undefined) {
+            this.#store.recordEvent({
+                rootAgentId: this.#rootAgentId,
+                entityId: workflowId,
+                runId: agent.runId,
+                type: "workflow.completion_ignored",
+                data: { agentId, reason: "cancel_requested" },
+            });
+            return workflow;
+        }
         if (event.status === "succeeded") {
             return this.acceptResult({
                 workflowId,
@@ -348,12 +365,12 @@ export class WorkflowEngine {
     async cancel(workflowId: WorkflowId, signal?: AbortSignal): Promise<WorkflowCancelResult> {
         const id = parseWorkflowId(workflowId);
         const stopErrors: string[] = [];
-        let workflow = this.#store.getWorkflow(id, this.#rootAgentId);
+        let workflow = this.#store.requestWorkflowCancellation(id, this.#rootAgentId);
         for (const snapshot of workflow.nodes) {
             if (signal?.aborted) throw signal.reason;
             let node = this.#node(this.#store.getWorkflow(id, this.#rootAgentId), snapshot.nodeId);
-            if (node.status === "succeeded" || node.status === "cancelled") continue;
-            if (node.status === "running") {
+            if (node.status === "succeeded") continue;
+            if (node.status === "running" || node.status === "cancelled") {
                 const binding = bindingFrom(node.output);
                 if (binding !== undefined && bindingMatchesNode(binding, node)) {
                     const agent = this.#findMappedAgent(binding);
@@ -365,6 +382,16 @@ export class WorkflowEngine {
                             await this.#supervisor.stop(agent.id, signal);
                         } catch (cause) {
                             stopErrors.push(`${node.nodeId}: ${errorText(cause)}`);
+                            this.#store.recordEvent({
+                                rootAgentId: this.#rootAgentId,
+                                entityId: id,
+                                type: "workflow.cancel_retry",
+                                data: {
+                                    nodeId: node.nodeId,
+                                    agentId: agent.id,
+                                    error: errorText(cause),
+                                },
+                            });
                             continue;
                         }
                     }
@@ -393,6 +420,21 @@ export class WorkflowEngine {
 
     async #runTick(signal?: AbortSignal): Promise<WorkflowTickResult> {
         if (signal?.aborted) throw signal.reason;
+        // Intent survives a cancelled tool call, a late spawn, and coordinator restart.
+        let cancellationCursor: string | undefined;
+        do {
+            const page = this.#store.listWorkflows({
+                rootAgentId: this.#rootAgentId,
+                cancelRequestedOnly: true,
+                limit: 100,
+                ...(cancellationCursor === undefined ? {} : { cursor: cancellationCursor }),
+            });
+            for (const workflow of page.items) {
+                // eslint-disable-next-line no-await-in-loop
+                await this.cancel(workflow.id, signal);
+            }
+            cancellationCursor = page.nextCursor;
+        } while (cancellationCursor !== undefined);
         let resumed = 0;
         let spawnFailures = 0;
         const active = this.#activeWorkflows();
@@ -469,6 +511,12 @@ export class WorkflowEngine {
         nodeId: string,
         signal?: AbortSignal,
     ): Promise<{ readonly resumed: number; readonly failed: number }> {
+        if (
+            this.#store.getWorkflow(workflowId, this.#rootAgentId).cancelRequestedAt !== undefined
+        ) {
+            await this.cancel(workflowId, signal);
+            return { resumed: 0, failed: 0 };
+        }
         const node = this.#node(this.#store.getWorkflow(workflowId, this.#rootAgentId), nodeId);
         if (node.status !== "running") return { resumed: 0, failed: 0 };
         const binding = bindingFrom(node.output);
@@ -495,8 +543,21 @@ export class WorkflowEngine {
 
         try {
             await this.#supervisor.spawn(this.#spawnRequest(node, binding), signal);
+            if (
+                this.#store.getWorkflow(workflowId, this.#rootAgentId).cancelRequestedAt !==
+                undefined
+            ) {
+                await this.cancel(workflowId);
+            }
             return { resumed: 0, failed: 0 };
         } catch (cause) {
+            if (
+                this.#store.getWorkflow(workflowId, this.#rootAgentId).cancelRequestedAt !==
+                undefined
+            ) {
+                await this.cancel(workflowId);
+                return { resumed: 0, failed: 0 };
+            }
             const raced = this.#findMappedAgent(binding);
             if (raced !== undefined && !TERMINAL_AGENT_STATUSES.has(raced.status)) {
                 return { resumed: 1, failed: 0 };
@@ -510,6 +571,7 @@ export class WorkflowEngine {
         const task = taskFromNode(node);
         return {
             ...task,
+            runId: binding.runId,
             alias: binding.alias,
             displayName: task.displayName ?? task.alias,
             metadata: {
@@ -589,7 +651,9 @@ export class WorkflowEngine {
                     limit: 100,
                     ...(cursor ? { cursor } : {}),
                 });
-                result.push(...page.items);
+                result.push(
+                    ...page.items.filter((workflow) => workflow.cancelRequestedAt === undefined),
+                );
                 cursor = page.nextCursor;
             } while (cursor !== undefined);
         }

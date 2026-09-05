@@ -1,7 +1,7 @@
 import Database from "better-sqlite3";
 import { StorageClosedError, ValidationError } from "../domain/errors.ts";
-import type { Failpoint } from "../faults.ts";
 import { validateNonNegativeInteger, validatePositiveInteger } from "../domain/validation.ts";
+import type { Failpoint } from "../faults.ts";
 import { migrate } from "./migrations.ts";
 
 export interface Clock {

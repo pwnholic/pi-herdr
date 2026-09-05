@@ -46,6 +46,8 @@ interface IdempotencyRow extends MessageRow {
 }
 
 interface ReplyRow {
+    readonly sender_run_id: string | null;
+    readonly recipient_run_id: string;
     readonly thread_id: string;
     readonly sender_agent_id: string | null;
     readonly recipient_agent_id: string;
@@ -55,6 +57,7 @@ interface ReplyRow {
 
 interface AgentNamespaceRow {
     readonly id: string;
+    readonly run_id: string;
     readonly parent_agent_id: string | null;
     readonly root_agent_id: string;
 }
@@ -89,6 +92,8 @@ export interface RequeueDeadLetterInput {
 
 export interface ClaimMessagesInput {
     readonly recipientAgentId: AgentId;
+    readonly recipientRunId?: string;
+    readonly preferredLane?: "control" | "result" | "ordinary";
     readonly owner: string;
     readonly leaseMs: number;
     readonly limit?: number;
@@ -210,6 +215,13 @@ export class MailboxRepository {
                 const recipient = this.#requireAgent(recipientAgentId);
                 const sender =
                     senderAgentId === undefined ? undefined : this.#requireAgent(senderAgentId);
+                if (
+                    (input.senderRunId !== undefined && input.senderRunId !== sender?.run_id) ||
+                    (input.recipientRunId !== undefined &&
+                        input.recipientRunId !== recipient.run_id)
+                ) {
+                    throw new ValidationError("Message belongs to a superseded assignment");
+                }
                 if (sender !== undefined && sender.root_agent_id !== recipient.root_agent_id) {
                     throw new ValidationError(
                         "Sender and recipient belong to different communication namespaces",
@@ -245,10 +257,16 @@ export class MailboxRepository {
                 if (replyToMessageId !== undefined) {
                     const reply = this.#storage.connection
                         .prepare(
-                            "SELECT thread_id, sender_agent_id, recipient_agent_id, hop_count, kind FROM mailbox_messages WHERE id = ?",
+                            "SELECT thread_id, sender_agent_id, recipient_agent_id, sender_run_id, recipient_run_id, hop_count, kind FROM mailbox_messages WHERE id = ?",
                         )
                         .get(replyToMessageId) as ReplyRow | undefined;
                     if (!reply) throw new NotFoundError("message", replyToMessageId);
+                    if (
+                        reply.sender_run_id !== recipient.run_id ||
+                        reply.recipient_run_id !== sender?.run_id
+                    ) {
+                        throw new ValidationError("Cannot reply across assignment generations");
+                    }
                     if (threadId !== undefined && threadId !== reply.thread_id) {
                         throw new ValidationError("threadId must match the replied-to message", {
                             field: "threadId",
@@ -283,12 +301,17 @@ export class MailboxRepository {
                     });
                 }
 
-                const senderScope = senderAgentId ?? "@system";
+                const senderScope =
+                    sender === undefined
+                        ? `@system:${recipient.root_agent_id}`
+                        : `${sender.id}:${sender.run_id}`;
                 const requestHash =
                     idempotencyKey === undefined
                         ? undefined
                         : intentHash({
                               senderAgentId: senderAgentId ?? null,
+                              senderRunId: sender?.run_id ?? null,
+                              recipientRunId: recipient.run_id,
                               recipientAgentId,
                               threadId: threadId ?? null,
                               replyToMessageId: replyToMessageId ?? null,
@@ -327,18 +350,72 @@ export class MailboxRepository {
                 }
 
                 const resolvedThreadId = threadId ?? createThreadId();
-                this.#assertQueueCapacity(senderAgentId, recipientAgentId, resolvedThreadId);
+                this.#assertQueueCapacity(
+                    senderScope,
+                    recipientAgentId,
+                    resolvedThreadId,
+                    input.kind,
+                );
                 try {
                     this.#storage.hit("mailbox.enqueue.before_insert", { messageId: id });
                     this.#storage.connection
                         .prepare(`
-                    INSERT INTO mailbox_messages(
-                        id, sender_agent_id, sender_scope, recipient_agent_id, root_agent_id, thread_id,
-                        reply_to_message_id, kind, content, metadata_json, state,
-                        delivery_mode, required, hop_count,
-                        attempt_count, max_attempts, available_at, expires_at,
-                        idempotency_key, intent_hash, created_at, updated_at, revision
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, 0)
+                            INSERT INTO
+                                mailbox_messages (
+                                    id,
+                                    sender_agent_id,
+                                    sender_scope,
+                                    recipient_agent_id,
+                                    root_agent_id,
+                                    thread_id,
+                                    reply_to_message_id,
+                                    kind,
+                                    content,
+                                    metadata_json,
+                                    state,
+                                    delivery_mode,
+                                    required,
+                                    hop_count,
+                                    sender_run_id,
+                                    recipient_run_id,
+                                    attempt_count,
+                                    max_attempts,
+                                    available_at,
+                                    expires_at,
+                                    idempotency_key,
+                                    intent_hash,
+                                    created_at,
+                                    updated_at,
+                                    revision
+                                )
+                            VALUES
+                                (
+                                    ?,
+                                    ?,
+                                    ?,
+                                    ?,
+                                    ?,
+                                    ?,
+                                    ?,
+                                    ?,
+                                    ?,
+                                    ?,
+                                    'queued',
+                                    ?,
+                                    ?,
+                                    ?,
+                                    ?,
+                                    ?,
+                                    0,
+                                    ?,
+                                    ?,
+                                    ?,
+                                    ?,
+                                    ?,
+                                    ?,
+                                    ?,
+                                    0
+                                )
                 `)
                         .run(
                             id,
@@ -354,6 +431,8 @@ export class MailboxRepository {
                             deliveryMode,
                             required ? 1 : 0,
                             hopCount,
+                            sender?.run_id ?? null,
+                            recipient.run_id,
                             maxAttempts,
                             availableAt,
                             expiresAt ?? null,
@@ -511,6 +590,15 @@ export class MailboxRepository {
 
     claim(input: ClaimMessagesInput): readonly MailboxMessage[] {
         const recipientAgentId = parseAgentId(input.recipientAgentId);
+        const lane = input.preferredLane ?? "control";
+        if (!["control", "result", "ordinary"].includes(lane))
+            throw new ValidationError("Invalid mailbox lane");
+        if (
+            input.recipientRunId !== undefined &&
+            this.#requireAgent(recipientAgentId).run_id !== input.recipientRunId
+        ) {
+            throw new ValidationError("Mailbox consumer belongs to a superseded assignment");
+        }
         const owner = validateLabel(input.owner, "owner", 256);
         const leaseMs = validatePositiveInteger(input.leaseMs, "leaseMs", 3_600_000);
         const limit = validatePageLimit(input.limit);
@@ -521,51 +609,99 @@ export class MailboxRepository {
 
         return this.#storage.connection
             .transaction(() => {
+                if (
+                    input.recipientRunId !== undefined &&
+                    this.#requireAgent(recipientAgentId).run_id !== input.recipientRunId
+                ) {
+                    throw new ValidationError(
+                        "Mailbox consumer belongs to a superseded assignment",
+                    );
+                }
                 this.#runMaintenance(now);
                 const candidates = this.#storage.connection
                     .prepare(
                         messageId === undefined
                             ? `
-                                SELECT candidate.* FROM mailbox_messages AS candidate
-                                WHERE candidate.recipient_agent_id = ?
-                                  AND candidate.state = 'queued'
-                                  AND candidate.available_at <= ?
-                                  AND NOT EXISTS (
-                                      SELECT 1 FROM mailbox_messages AS earlier
-                                      WHERE earlier.recipient_agent_id = candidate.recipient_agent_id
-                                        AND earlier.state IN ('queued','delivered','read')
+                            SELECT
+                                candidate.*
+                            FROM
+                                mailbox_messages AS candidate
+                            WHERE
+                                candidate.recipient_agent_id = ?
+                                AND candidate.state = 'queued'
+                                AND candidate.available_at <= ?
+                                AND NOT EXISTS (
+                                    SELECT
+                                        1
+                                    FROM
+                                        mailbox_messages AS earlier
+                                    WHERE
+                                        earlier.recipient_agent_id = candidate.recipient_agent_id
+                                        AND (earlier.kind = 'control') = (candidate.kind = 'control')
+                                        AND (earlier.kind = 'result') = (candidate.kind = 'result')
+                                        AND earlier.state IN ('queued', 'delivered', 'read')
                                         AND earlier.sequence < candidate.sequence
-                                  )
-                                ORDER BY candidate.sequence
-                                LIMIT ?
+                                )
+                            ORDER BY
+                                (CASE candidate.kind WHEN 'control' THEN 'control' WHEN 'result' THEN 'result' ELSE 'ordinary' END = ?) DESC,
+                                CASE candidate.kind
+                                    WHEN 'control' THEN 0
+                                    WHEN 'result' THEN 1
+                                    ELSE 2
+                                END,
+                                candidate.sequence
+                            LIMIT
+                                ?
                             `
                             : `
-                                SELECT * FROM mailbox_messages
-                                WHERE recipient_agent_id = ? AND id = ?
-                                  AND state = 'queued' AND available_at <= ?
-                                  AND NOT EXISTS (
-                                      SELECT 1 FROM mailbox_messages AS earlier
-                                      WHERE earlier.recipient_agent_id = mailbox_messages.recipient_agent_id
-                                        AND earlier.state IN ('queued','delivered','read')
+                            SELECT
+                                *
+                            FROM
+                                mailbox_messages
+                            WHERE
+                                recipient_agent_id = ?
+                                AND id = ?
+                                AND state = 'queued'
+                                AND available_at <= ?
+                                AND NOT EXISTS (
+                                    SELECT
+                                        1
+                                    FROM
+                                        mailbox_messages AS earlier
+                                    WHERE
+                                        earlier.recipient_agent_id = mailbox_messages.recipient_agent_id
+                                        AND (earlier.kind = 'control') = (mailbox_messages.kind = 'control')
+                                        AND (earlier.kind = 'result') = (mailbox_messages.kind = 'result')
+                                        AND earlier.state IN ('queued', 'delivered', 'read')
                                         AND earlier.sequence < mailbox_messages.sequence
-                                  )
-                                LIMIT ?
+                                )
+                            LIMIT
+                                ?
                             `,
                     )
                     .all(
                         ...(messageId === undefined
-                            ? [recipientAgentId, now, limit]
+                            ? [recipientAgentId, now, lane, limit]
                             : [recipientAgentId, messageId, now, limit]),
                     ) as MessageRow[];
                 const claimed: MailboxMessage[] = [];
                 for (const row of candidates) {
                     const result = this.#storage.connection
                         .prepare(`
-                        UPDATE mailbox_messages
-                        SET state = 'delivered', attempt_count = attempt_count + 1,
-                            delivered_at = ?, read_at = NULL, lease_owner = ?, lease_expires_at = ?,
-                            updated_at = ?, revision = revision + 1
-                        WHERE id = ? AND revision = ? AND state = 'queued'
+                            UPDATE mailbox_messages
+                            SET
+                                state = 'delivered',
+                                attempt_count = attempt_count + 1,
+                                delivered_at = ?,
+                                read_at = NULL,
+                                lease_owner = ?,
+                                lease_expires_at = ?,
+                                updated_at = ?,
+                                revision = revision + 1
+                            WHERE
+                                id = ?
+                                AND revision = ?
+                                AND state = 'queued'
                     `)
                         .run(now, owner, now + leaseMs, now, row.id, row.revision);
                     if (result.changes === 1)
@@ -600,8 +736,14 @@ export class MailboxRepository {
         const result = this.#storage.connection
             .prepare(`
                 UPDATE mailbox_messages
-                SET lease_expires_at = ?, updated_at = ?, revision = revision + 1
-                WHERE id = ? AND revision = ? AND state IN ('delivered', 'read')
+                SET
+                    lease_expires_at = ?,
+                    updated_at = ?,
+                    revision = revision + 1
+                WHERE
+                    id = ?
+                    AND revision = ?
+                    AND state IN ('delivered', 'read')
             `)
             .run(now + leaseMs, now, id, expected);
         if (result.changes !== 1) this.#throwRevision(id, expected);
@@ -627,9 +769,17 @@ export class MailboxRepository {
             const result = this.#storage.connection
                 .prepare(`
                     UPDATE mailbox_messages
-                    SET state = 'dead_letter', dead_lettered_at = ?, dead_letter_reason = ?,
-                        lease_owner = NULL, lease_expires_at = NULL, updated_at = ?, revision = revision + 1
-                    WHERE id = ? AND revision = ?
+                    SET
+                        state = 'dead_letter',
+                        dead_lettered_at = ?,
+                        dead_letter_reason = ?,
+                        lease_owner = NULL,
+                        lease_expires_at = NULL,
+                        updated_at = ?,
+                        revision = revision + 1
+                    WHERE
+                        id = ?
+                        AND revision = ?
                 `)
                 .run(now, reason ?? "delivery_attempts_exhausted", now, id, expected);
             if (result.changes !== 1) this.#throwRevision(id, expected);
@@ -637,9 +787,18 @@ export class MailboxRepository {
             const result = this.#storage.connection
                 .prepare(`
                     UPDATE mailbox_messages
-                    SET state = 'queued', available_at = ?, delivered_at = NULL, read_at = NULL,
-                        lease_owner = NULL, lease_expires_at = NULL, updated_at = ?, revision = revision + 1
-                    WHERE id = ? AND revision = ?
+                    SET
+                        state = 'queued',
+                        available_at = ?,
+                        delivered_at = NULL,
+                        read_at = NULL,
+                        lease_owner = NULL,
+                        lease_expires_at = NULL,
+                        updated_at = ?,
+                        revision = revision + 1
+                    WHERE
+                        id = ?
+                        AND revision = ?
                 `)
                 .run(availableAt, now, id, expected);
             if (result.changes !== 1) this.#throwRevision(id, expected);
@@ -656,6 +815,7 @@ export class MailboxRepository {
                 ? undefined
                 : validatePositiveInteger(input.ttlMs, "ttlMs", 90 * 24 * 60 * 60 * 1000);
         const row = this.#getRow(id);
+        this.#assertAssignment(row);
         if (row.sender_agent_id !== sender) throw new NotFoundError("message", id);
         if (row.revision !== expected) this.#throwRevision(id, expected);
         if (row.state !== "dead_letter") {
@@ -665,12 +825,24 @@ export class MailboxRepository {
         const result = this.#storage.connection
             .prepare(`
                 UPDATE mailbox_messages
-                SET state = 'queued', attempt_count = 0, available_at = ?, expires_at = ?,
-                    delivered_at = NULL, read_at = NULL, acked_at = NULL,
-                    dead_lettered_at = NULL, dead_letter_reason = NULL,
-                    lease_owner = NULL, lease_expires_at = NULL,
-                    updated_at = ?, revision = revision + 1
-                WHERE id = ? AND revision = ? AND state = 'dead_letter'
+                SET
+                    state = 'queued',
+                    attempt_count = 0,
+                    available_at = ?,
+                    expires_at = ?,
+                    delivered_at = NULL,
+                    read_at = NULL,
+                    acked_at = NULL,
+                    dead_lettered_at = NULL,
+                    dead_letter_reason = NULL,
+                    lease_owner = NULL,
+                    lease_expires_at = NULL,
+                    updated_at = ?,
+                    revision = revision + 1
+                WHERE
+                    id = ?
+                    AND revision = ?
+                    AND state = 'dead_letter'
             `)
             .run(now, ttlMs === undefined ? null : now + ttlMs, now, id, expected);
         if (result.changes !== 1) this.#throwRevision(id, expected);
@@ -691,9 +863,17 @@ export class MailboxRepository {
         const result = this.#storage.connection
             .prepare(`
                 UPDATE mailbox_messages
-                SET state = 'dead_letter', dead_lettered_at = ?, dead_letter_reason = ?,
-                    lease_owner = NULL, lease_expires_at = NULL, updated_at = ?, revision = revision + 1
-                WHERE id = ? AND revision = ?
+                SET
+                    state = 'dead_letter',
+                    dead_lettered_at = ?,
+                    dead_letter_reason = ?,
+                    lease_owner = NULL,
+                    lease_expires_at = NULL,
+                    updated_at = ?,
+                    revision = revision + 1
+                WHERE
+                    id = ?
+                    AND revision = ?
             `)
             .run(now, reason, now, id, expected);
         if (result.changes !== 1) this.#throwRevision(id, expected);
@@ -712,11 +892,18 @@ export class MailboxRepository {
         this.runMaintenance();
         const rows = this.#storage.connection
             .prepare(`
-                SELECT * FROM mailbox_messages
-                WHERE recipient_agent_id = ? AND required = 1
-                  AND state IN ('queued','delivered','read')
-                ORDER BY sequence
-                LIMIT ?
+                SELECT
+                    *
+                FROM
+                    mailbox_messages
+                WHERE
+                    recipient_agent_id = ?
+                    AND required = 1
+                    AND state IN ('queued', 'delivered', 'read')
+                ORDER BY
+                    sequence
+                LIMIT
+                    ?
             `)
             .all(recipientAgentId, pageLimit) as MessageRow[];
         return rows.map(toMailboxMessage);
@@ -757,15 +944,54 @@ export class MailboxRepository {
         const row = this.#storage.connection
             .prepare(`
                 SELECT
-                  SUM(CASE WHEN state = 'queued' THEN 1 ELSE 0 END) AS queued,
-                  SUM(CASE WHEN state = 'delivered' THEN 1 ELSE 0 END) AS delivered,
-                  SUM(CASE WHEN state = 'read' THEN 1 ELSE 0 END) AS read,
-                  SUM(CASE WHEN state = 'acked' THEN 1 ELSE 0 END) AS acknowledged,
-                  SUM(CASE WHEN state = 'dead_letter' THEN 1 ELSE 0 END) AS dead_lettered,
-                  MIN(CASE WHEN state IN ('queued','delivered','read') THEN created_at END) AS oldest_pending_at,
-                  COALESCE(SUM(CASE WHEN state IN ('queued','delivered','read') THEN length(CAST(content AS BLOB)) ELSE 0 END), 0) AS total_pending_bytes
-                FROM mailbox_messages
-                WHERE root_agent_id = ?
+                    SUM(
+                        CASE
+                            WHEN state = 'queued' THEN 1
+                            ELSE 0
+                        END
+                    ) AS queued,
+                    SUM(
+                        CASE
+                            WHEN state = 'delivered' THEN 1
+                            ELSE 0
+                        END
+                    ) AS delivered,
+                    SUM(
+                        CASE
+                            WHEN state = 'read' THEN 1
+                            ELSE 0
+                        END
+                    ) AS read,
+                    SUM(
+                        CASE
+                            WHEN state = 'acked' THEN 1
+                            ELSE 0
+                        END
+                    ) AS acknowledged,
+                    SUM(
+                        CASE
+                            WHEN state = 'dead_letter' THEN 1
+                            ELSE 0
+                        END
+                    ) AS dead_lettered,
+                    MIN(
+                        CASE
+                            WHEN state IN ('queued', 'delivered', 'read') THEN created_at
+                        END
+                    ) AS oldest_pending_at,
+                    COALESCE(
+                        SUM(
+                            CASE
+                                WHEN state IN ('queued', 'delivered', 'read') THEN length(CAST(content AS BLOB))
+                                ELSE 0
+                            END
+                        ),
+                        0
+                    ) AS total_pending_bytes
+                FROM
+                    mailbox_messages
+                WHERE
+                    root_agent_id = ?
             `)
             .get(rootAgentId) as StatsRow;
         return {
@@ -800,16 +1026,26 @@ export class MailboxRepository {
                     .run(now).changes;
                 const rows = this.#storage.connection
                     .prepare(`
-                        SELECT * FROM mailbox_messages AS candidate
-                        WHERE candidate.kind != 'result'
-                          AND candidate.state IN ('acked','dead_letter')
-                          AND candidate.updated_at <= ?
-                          AND NOT EXISTS (
-                            SELECT 1 FROM mailbox_messages AS reply
-                            WHERE reply.reply_to_message_id = candidate.id
-                          )
-                        ORDER BY candidate.sequence
-                        LIMIT ?
+                        SELECT
+                            *
+                        FROM
+                            mailbox_messages AS candidate
+                        WHERE
+                            candidate.kind != 'result'
+                            AND candidate.state IN ('acked', 'dead_letter')
+                            AND candidate.updated_at <= ?
+                            AND NOT EXISTS (
+                                SELECT
+                                    1
+                                FROM
+                                    mailbox_messages AS reply
+                                WHERE
+                                    reply.reply_to_message_id = candidate.id
+                            )
+                        ORDER BY
+                            candidate.sequence
+                        LIMIT
+                            ?
                     `)
                     .all(now - retentionMs, limit) as MessageRow[];
                 let pruned = 0;
@@ -817,14 +1053,22 @@ export class MailboxRepository {
                     if (row.idempotency_key !== null && row.intent_hash !== null) {
                         this.#storage.connection
                             .prepare(`
-                                INSERT INTO mailbox_idempotency_tombstones(
-                                  sender_scope, idempotency_key, intent_hash, message_id,
-                                  retained_until, created_at
-                                ) VALUES (?, ?, ?, ?, ?, ?)
-                                ON CONFLICT(sender_scope, idempotency_key) DO UPDATE SET
-                                  intent_hash = excluded.intent_hash,
-                                  message_id = excluded.message_id,
-                                  retained_until = MAX(retained_until, excluded.retained_until)
+                                INSERT INTO
+                                    mailbox_idempotency_tombstones (
+                                        sender_scope,
+                                        idempotency_key,
+                                        intent_hash,
+                                        message_id,
+                                        retained_until,
+                                        created_at
+                                    )
+                                VALUES
+                                    (?, ?, ?, ?, ?, ?)
+                                ON CONFLICT (sender_scope, idempotency_key) DO UPDATE
+                                SET
+                                    intent_hash = excluded.intent_hash,
+                                    message_id = excluded.message_id,
+                                    retained_until = MAX(retained_until, excluded.retained_until)
                             `)
                             .run(
                                 row.sender_scope,
@@ -845,28 +1089,91 @@ export class MailboxRepository {
     }
 
     #runMaintenance(now: number): MaintenanceResult {
+        this.#storage.connection
+            .prepare(`
+                UPDATE mailbox_messages
+                SET
+                    state = 'dead_letter',
+                    dead_lettered_at = ?,
+                    dead_letter_reason = 'superseded_assignment',
+                    lease_owner = NULL,
+                    lease_expires_at = NULL,
+                    updated_at = ?,
+                    revision = revision + 1
+                WHERE
+                    state NOT IN ('acked', 'dead_letter')
+                    AND (
+                        recipient_run_id != (
+                            SELECT
+                                run_id
+                            FROM
+                                agents
+                            WHERE
+                                id = recipient_agent_id
+                        )
+                        OR (
+                            sender_agent_id IS NOT NULL
+                            AND sender_run_id != (
+                                SELECT
+                                    run_id
+                                FROM
+                                    agents
+                                WHERE
+                                    id = sender_agent_id
+                            )
+                        )
+                    )
+        `)
+            .run(now, now);
         const expired = this.#storage.connection
             .prepare(`
                 UPDATE mailbox_messages
-                SET state = 'dead_letter', dead_lettered_at = ?, dead_letter_reason = 'expired',
-                    lease_owner = NULL, lease_expires_at = NULL, updated_at = ?, revision = revision + 1
-                WHERE state NOT IN ('acked','dead_letter') AND expires_at IS NOT NULL AND expires_at <= ?
+                SET
+                    state = 'dead_letter',
+                    dead_lettered_at = ?,
+                    dead_letter_reason = 'expired',
+                    lease_owner = NULL,
+                    lease_expires_at = NULL,
+                    updated_at = ?,
+                    revision = revision + 1
+                WHERE
+                    state NOT IN ('acked', 'dead_letter')
+                    AND expires_at IS NOT NULL
+                    AND expires_at <= ?
             `)
             .run(now, now, now).changes;
         const attemptsExhausted = this.#storage.connection
             .prepare(`
                 UPDATE mailbox_messages
-                SET state = 'dead_letter', dead_lettered_at = ?, dead_letter_reason = 'delivery_attempts_exhausted',
-                    lease_owner = NULL, lease_expires_at = NULL, updated_at = ?, revision = revision + 1
-                WHERE state IN ('delivered','read') AND lease_expires_at <= ? AND attempt_count >= max_attempts
+                SET
+                    state = 'dead_letter',
+                    dead_lettered_at = ?,
+                    dead_letter_reason = 'delivery_attempts_exhausted',
+                    lease_owner = NULL,
+                    lease_expires_at = NULL,
+                    updated_at = ?,
+                    revision = revision + 1
+                WHERE
+                    state IN ('delivered', 'read')
+                    AND lease_expires_at <= ?
+                    AND attempt_count >= max_attempts
             `)
             .run(now, now, now).changes;
         const requeued = this.#storage.connection
             .prepare(`
                 UPDATE mailbox_messages
-                SET state = 'queued', delivered_at = NULL, read_at = NULL,
-                    lease_owner = NULL, lease_expires_at = NULL, updated_at = ?, revision = revision + 1
-                WHERE state IN ('delivered','read') AND lease_expires_at <= ? AND attempt_count < max_attempts
+                SET
+                    state = 'queued',
+                    delivered_at = NULL,
+                    read_at = NULL,
+                    lease_owner = NULL,
+                    lease_expires_at = NULL,
+                    updated_at = ?,
+                    revision = revision + 1
+                WHERE
+                    state IN ('delivered', 'read')
+                    AND lease_expires_at <= ?
+                    AND attempt_count < max_attempts
             `)
             .run(now, now).changes;
         return { expired, attemptsExhausted, requeued };
@@ -908,6 +1215,7 @@ export class MailboxRepository {
         allowedStates: readonly string[],
         now: number,
     ): void {
+        this.#assertAssignment(row);
         if (row.recipient_agent_id !== recipient) throw new NotFoundError("message", row.id);
         if (row.revision !== expected)
             throw new RevisionConflictError("message", row.id, expected, row.revision);
@@ -925,6 +1233,16 @@ export class MailboxRepository {
             row.lease_expires_at <= now
         ) {
             throw new LeaseConflictError("message", row.id, row.lease_owner ?? undefined);
+        }
+    }
+
+    #assertAssignment(row: MessageRow): void {
+        if (
+            this.#requireAgent(row.recipient_agent_id as AgentId).run_id !== row.recipient_run_id ||
+            (row.sender_agent_id !== null &&
+                this.#requireAgent(row.sender_agent_id as AgentId).run_id !== row.sender_run_id)
+        ) {
+            throw new ValidationError("Message belongs to a superseded assignment");
         }
     }
 
@@ -957,12 +1275,18 @@ export class MailboxRepository {
     }
 
     #assertQueueCapacity(
-        senderAgentId: AgentId | undefined,
+        senderScope: string,
         recipientAgentId: AgentId,
         threadId: string,
+        kind: string,
     ): void {
-        const active = "state IN ('queued','delivered','read')";
-        const senderScope = senderAgentId ?? "@system";
+        const lane =
+            kind === "control"
+                ? "kind = 'control'"
+                : kind === "result"
+                  ? "kind = 'result'"
+                  : "kind NOT IN ('control','result')";
+        const active = `state IN ('queued','delivered','read') AND ${lane}`;
         const senderCount = this.#storage.connection
             .prepare(
                 `SELECT COUNT(*) AS count FROM mailbox_messages WHERE sender_scope = ? AND ${active}`,
@@ -994,14 +1318,31 @@ export class MailboxRepository {
         const descendant = parseAgentId(descendantValue);
         const row = this.#storage.connection
             .prepare(`
-                WITH RECURSIVE ancestors(id) AS (
-                  SELECT parent_agent_id FROM agents WHERE id = ?
-                  UNION ALL
-                  SELECT agents.parent_agent_id
-                  FROM agents JOIN ancestors ON agents.id = ancestors.id
-                  WHERE agents.parent_agent_id IS NOT NULL
-                )
-                SELECT 1 FROM ancestors WHERE id = ? LIMIT 1
+                WITH RECURSIVE
+                    ancestors (id) AS (
+                        SELECT
+                            parent_agent_id
+                        FROM
+                            agents
+                        WHERE
+                            id = ?
+                        UNION ALL
+                        SELECT
+                            agents.parent_agent_id
+                        FROM
+                            agents
+                            JOIN ancestors ON agents.id = ancestors.id
+                        WHERE
+                            agents.parent_agent_id IS NOT NULL
+                    )
+                SELECT
+                    1
+                FROM
+                    ancestors
+                WHERE
+                    id = ?
+                LIMIT
+                    1
             `)
             .get(descendant, candidate);
         return row !== undefined;
@@ -1009,7 +1350,7 @@ export class MailboxRepository {
 
     #requireAgent(agentId: AgentId): AgentNamespaceRow {
         const row = this.#storage.connection
-            .prepare("SELECT id, parent_agent_id, root_agent_id FROM agents WHERE id = ?")
+            .prepare("SELECT id, run_id, parent_agent_id, root_agent_id FROM agents WHERE id = ?")
             .get(agentId) as AgentNamespaceRow | undefined;
         if (!row) throw new NotFoundError("agent", agentId);
         return row;

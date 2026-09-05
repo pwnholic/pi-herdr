@@ -9,6 +9,7 @@ const MESSAGE_ID = "22222222-2222-4222-8222-222222222222" as MessageId;
 
 function message(revision = 1): MailboxMessage {
     return {
+        recipientRunId: "test-run",
         id: MESSAGE_ID,
         rootAgentId: AGENT_ID,
         recipientAgentId: AGENT_ID,

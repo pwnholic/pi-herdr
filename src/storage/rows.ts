@@ -11,6 +11,7 @@ import { parseStoredJson } from "./json.ts";
 
 export interface AgentRow {
     readonly id: string;
+    readonly run_id: string;
     readonly alias: string;
     readonly display_name: string;
     readonly role: string;
@@ -36,6 +37,8 @@ export interface MessageRow {
     readonly id: string;
     readonly sender_agent_id: string | null;
     readonly sender_scope: string;
+    readonly sender_run_id: string | null;
+    readonly recipient_run_id: string;
     readonly root_agent_id: string | null;
     readonly recipient_agent_id: string;
     readonly thread_id: string;
@@ -68,6 +71,7 @@ export interface MessageRow {
 export interface WorkflowRow {
     readonly id: string;
     readonly root_agent_id: string;
+    readonly cancel_requested_at: number | null;
     readonly name: string;
     readonly status: WorkflowStatus;
     readonly metadata_json: string;
@@ -93,6 +97,7 @@ export interface WorkflowNodeRow {
 export function toAgentRecord(row: AgentRow): AgentRecord {
     return {
         id: row.id as AgentId,
+        runId: row.run_id,
         alias: row.alias,
         displayName: row.display_name,
         role: row.role,
@@ -117,6 +122,8 @@ export function toAgentRecord(row: AgentRow): AgentRecord {
 export function toMailboxMessage(row: MessageRow): MailboxMessage {
     return {
         id: row.id as MessageId,
+        ...(row.sender_run_id === null ? {} : { senderRunId: row.sender_run_id }),
+        recipientRunId: row.recipient_run_id,
         rootAgentId: (row.root_agent_id ?? row.recipient_agent_id) as AgentId,
         ...(row.sender_agent_id === null ? {} : { senderAgentId: row.sender_agent_id as AgentId }),
         recipientAgentId: row.recipient_agent_id as AgentId,
@@ -174,6 +181,7 @@ export function toWorkflowRecord(
 ): WorkflowRecord {
     return {
         id: row.id as WorkflowId,
+        ...(row.cancel_requested_at === null ? {} : { cancelRequestedAt: row.cancel_requested_at }),
         rootAgentId: row.root_agent_id as AgentId,
         name: row.name,
         status: row.status,

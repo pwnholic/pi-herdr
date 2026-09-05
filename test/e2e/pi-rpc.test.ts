@@ -1,18 +1,14 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { test } from "node:test";
 import { SqliteControlPlaneStore } from "../../src/storage/index.ts";
 
-const PI = process.env.PI_BIN ?? "/home/pwnholic/.local/bin/pi";
+const PI = process.env.PI_BIN ?? "pi";
 
-test("real Pi RPC loads the isolated extension and persists its coordinator", async (context) => {
-    if (!existsSync(PI)) {
-        context.skip(`Pi binary is unavailable at ${PI}`);
-        return;
-    }
+test("real Pi RPC loads the isolated extension and persists its coordinator", async () => {
     const directory = mkdtempSync(join(tmpdir(), "pi-herdr-rpc-e2e-"));
     const database = join(directory, "control.sqlite");
     const child = spawn(
@@ -32,6 +28,10 @@ test("real Pi RPC loads the isolated extension and persists its coordinator", as
             cwd: process.cwd(),
             env: {
                 ...process.env,
+                PI_HERDR_AGENT_ID: undefined,
+                PI_HERDR_PARENT_ID: undefined,
+                PI_HERDR_RUN_ID: undefined,
+                HERDR_ENV: undefined,
                 PI_HERDR_DB: database,
                 PI_HERDR_COMPLETION_POLL_MS: "60000",
             },

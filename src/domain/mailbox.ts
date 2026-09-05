@@ -20,6 +20,8 @@ export interface MailboxMessage {
     readonly id: MessageId;
     readonly rootAgentId: AgentId;
     readonly senderAgentId?: AgentId;
+    readonly senderRunId?: string;
+    readonly recipientRunId: string;
     readonly recipientAgentId: AgentId;
     readonly threadId: ThreadId;
     readonly replyToMessageId?: MessageId;
@@ -49,6 +51,8 @@ export interface MailboxMessage {
 export interface EnqueueMessageInput {
     readonly id?: MessageId;
     readonly senderAgentId?: AgentId;
+    readonly senderRunId?: string;
+    readonly recipientRunId?: string;
     readonly recipientAgentId: AgentId;
     readonly threadId?: ThreadId;
     readonly replyToMessageId?: MessageId;

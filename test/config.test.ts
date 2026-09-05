@@ -21,6 +21,15 @@ describe("resolveConfig", () => {
     });
 
     test("rejects unsafe resource limits", () => {
+        for (const env of [
+            { PI_HERDR_MAX_PAGE_SIZE: "101" },
+            { PI_HERDR_MAX_RESULT_BYTES: "1048577" },
+        ]) {
+            assert.throws(
+                () => resolveConfig({ sessionDir: "/sessions/project", cwd: "/repo", env }),
+                /must be between/,
+            );
+        }
         assert.throws(
             () =>
                 resolveConfig({

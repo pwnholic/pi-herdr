@@ -6,7 +6,12 @@ import {
 } from "../domain/errors.ts";
 import type { AgentId, MessageId } from "../domain/ids.ts";
 import { parseAgentId, parseMessageId } from "../domain/ids.ts";
-import { assertJsonValue, type JsonValue, validateLabel } from "../domain/validation.ts";
+import {
+    assertJsonValue,
+    type JsonValue,
+    validateLabel,
+    MAX_MESSAGE_BYTES,
+} from "../domain/validation.ts";
 import type { StorageDatabase } from "./database.ts";
 import { canonicalJson, parseStoredJson } from "./json.ts";
 
@@ -19,6 +24,7 @@ export type CompletionOutboxState =
 
 export interface CompletionOutboxRecord {
     readonly agentId: AgentId;
+    readonly runId: string;
     readonly invocationToken: string;
     readonly payload: JsonValue;
     readonly state: CompletionOutboxState;
@@ -30,6 +36,7 @@ export interface CompletionOutboxRecord {
 
 interface CompletionRow {
     readonly agent_id: string;
+    readonly run_id: string;
     readonly invocation_token: string;
     readonly payload_json: string;
     readonly state: CompletionOutboxState;
@@ -41,6 +48,7 @@ interface CompletionRow {
 
 export interface DeclareCompletionInput {
     readonly agentId: AgentId;
+    readonly runId?: string;
     readonly invocationToken: string;
     readonly payload: JsonValue;
 }
@@ -78,19 +86,36 @@ export class CompletionRepository {
     declare(input: DeclareCompletionInput): CompletionOutboxRecord {
         const agentId = parseAgentId(input.agentId);
         const invocationToken = validateLabel(input.invocationToken, "invocationToken", 256);
-        assertJsonValue(input.payload, "payload");
+        assertJsonValue(input.payload, "payload", MAX_MESSAGE_BYTES);
         const payloadJson = canonicalJson(input.payload);
         const now = this.#storage.now();
         return this.#storage.connection
             .transaction(() => {
+                const agent = this.#storage.connection
+                    .prepare("SELECT run_id FROM agents WHERE id = ?")
+                    .get(agentId) as { run_id: string } | undefined;
+                if (
+                    agent === undefined ||
+                    (input.runId !== undefined && input.runId !== agent.run_id)
+                ) {
+                    throw new ValidationError(
+                        "Completion belongs to a superseded or missing assignment",
+                    );
+                }
+                const runId = agent.run_id;
                 this.#storage.hit("completion.declare.before_write", { agentId });
                 const current = this.get(agentId);
                 if (current !== undefined) {
                     const same =
+                        current.runId === runId &&
                         current.invocationToken === invocationToken &&
                         canonicalJson(current.payload) === payloadJson;
                     if (same && current.state !== "invalidated") return current;
-                    if (current.state !== "acknowledged" && current.state !== "invalidated") {
+                    if (
+                        current.runId === runId &&
+                        current.state !== "acknowledged" &&
+                        current.state !== "invalidated"
+                    ) {
                         throw new ConflictError(
                             "A different completion is already pending for this agent",
                             { agentId, state: current.state },
@@ -99,11 +124,19 @@ export class CompletionRepository {
                     const result = this.#storage.connection
                         .prepare(`
                             UPDATE completion_outbox
-                            SET invocation_token = ?, payload_json = ?, state = 'declared',
-                                message_id = NULL, updated_at = ?, revision = revision + 1
-                            WHERE agent_id = ? AND revision = ?
+                            SET
+                                run_id = ?,
+                                invocation_token = ?,
+                                payload_json = ?,
+                                state = 'declared',
+                                message_id = NULL,
+                                updated_at = ?,
+                                revision = revision + 1
+                            WHERE
+                                agent_id = ?
+                                AND revision = ?
                         `)
-                        .run(invocationToken, payloadJson, now, agentId, current.revision);
+                        .run(runId, invocationToken, payloadJson, now, agentId, current.revision);
                     if (result.changes !== 1) {
                         throw new RevisionConflictError(
                             "completion",
@@ -118,12 +151,22 @@ export class CompletionRepository {
                 }
                 this.#storage.connection
                     .prepare(`
-                        INSERT INTO completion_outbox(
-                            agent_id, invocation_token, payload_json, state, message_id,
-                            created_at, updated_at, revision
-                        ) VALUES (?, ?, ?, 'declared', NULL, ?, ?, 0)
+                        INSERT INTO
+                            completion_outbox (
+                                agent_id,
+                                run_id,
+                                invocation_token,
+                                payload_json,
+                                state,
+                                message_id,
+                                created_at,
+                                updated_at,
+                                revision
+                            )
+                        VALUES
+                            (?, ?, ?, ?, 'declared', NULL, ?, ?, 0)
                     `)
-                    .run(agentId, invocationToken, payloadJson, now, now);
+                    .run(agentId, runId, invocationToken, payloadJson, now, now);
                 const declared = this.get(agentId) as CompletionOutboxRecord;
                 this.#storage.hit("completion.declare.after_write", { agentId });
                 return declared;
@@ -210,12 +253,17 @@ export class CompletionRepository {
         const parentAgentId = parseAgentId(parentAgentIdValue);
         const rows = this.#storage.connection
             .prepare(`
-                SELECT completion_outbox.*
-                FROM completion_outbox
-                JOIN agents ON agents.id = completion_outbox.agent_id
-                WHERE agents.parent_agent_id = ?
-                  AND completion_outbox.state IN ('emitted','parent_applied')
-                ORDER BY completion_outbox.created_at, completion_outbox.agent_id
+                SELECT
+                    completion_outbox.*
+                FROM
+                    completion_outbox
+                    JOIN agents ON agents.id = completion_outbox.agent_id
+                WHERE
+                    agents.parent_agent_id = ?
+                    AND completion_outbox.state IN ('emitted', 'parent_applied')
+                ORDER BY
+                    completion_outbox.created_at,
+                    completion_outbox.agent_id
             `)
             .all(parentAgentId) as CompletionRow[];
         return rows.map(toCompletion);
@@ -227,9 +275,18 @@ export class CompletionRepository {
         const now = this.#storage.now();
         this.#storage.connection
             .prepare(`
-                INSERT INTO mailbox_effects(message_id, effect, state, created_at, updated_at, revision)
-                VALUES (?, ?, 'applying', ?, ?, 0)
-                ON CONFLICT(message_id) DO NOTHING
+                INSERT INTO
+                    mailbox_effects (
+                        message_id,
+                        effect,
+                        state,
+                        created_at,
+                        updated_at,
+                        revision
+                    )
+                VALUES
+                    (?, ?, 'applying', ?, ?, 0)
+                ON CONFLICT (message_id) DO NOTHING
             `)
             .run(messageId, effect, now, now);
         const current = this.#requireEffect(messageId);
@@ -259,8 +316,13 @@ export class CompletionRepository {
         const result = this.#storage.connection
             .prepare(`
                 UPDATE mailbox_effects
-                SET state = ?, updated_at = ?, revision = revision + 1
-                WHERE message_id = ? AND revision = ?
+                SET
+                    state = ?,
+                    updated_at = ?,
+                    revision = revision + 1
+                WHERE
+                    message_id = ?
+                    AND revision = ?
             `)
             .run(state, now, messageId, current.revision);
         if (result.changes !== 1) {
@@ -284,8 +346,14 @@ export class CompletionRepository {
         const result = this.#storage.connection
             .prepare(`
                 UPDATE completion_outbox
-                SET state = ?, message_id = ?, updated_at = ?, revision = revision + 1
-                WHERE agent_id = ? AND revision = ?
+                SET
+                    state = ?,
+                    message_id = ?,
+                    updated_at = ?,
+                    revision = revision + 1
+                WHERE
+                    agent_id = ?
+                    AND revision = ?
             `)
             .run(state, messageId ?? null, now, current.agentId, current.revision);
         if (result.changes !== 1) {
@@ -328,6 +396,7 @@ export class CompletionRepository {
 function toCompletion(row: CompletionRow): CompletionOutboxRecord {
     return {
         agentId: row.agent_id as AgentId,
+        runId: row.run_id,
         invocationToken: row.invocation_token,
         payload: parseStoredJson(row.payload_json),
         state: row.state,

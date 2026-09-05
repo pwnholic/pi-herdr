@@ -27,6 +27,7 @@ class FakeHerdr {
     readonly calls: Array<{ readonly name: string; readonly value?: unknown }> = [];
     failStart = false;
     failPrompt = false;
+    onPrompt: (() => void) | undefined;
     inspection: HerdrAgentInspection = { status: "idle", raw: {} };
 
     async createSurface(options: CreateHerdrSurfaceOptions): Promise<HerdrOwnedSurface> {
@@ -62,6 +63,7 @@ class FakeHerdr {
     ): Promise<HerdrOperationResult> {
         this.calls.push({ name: "prompt", value: text });
         if (this.failPrompt) throw new Error("prompt failed");
+        this.onPrompt?.();
         return RESULT;
     }
 
@@ -111,6 +113,32 @@ describe("AgentSupervisor", () => {
     let herdr: FakeHerdr;
     let supervisor: AgentSupervisor;
     let activeFailpoint: Failpoint | undefined;
+
+    test("a late prompt receipt does not reverse an already settled child status", async () => {
+        herdr.onPrompt = () => {
+            let agent = store.getAgentByAlias("fast-worker", parent.id);
+            for (const status of ["running", "idle"] as const) {
+                agent = store.transitionAgent({
+                    agentId: agent.id,
+                    status,
+                    patch: {},
+                    expectedRevision: agent.revision,
+                });
+            }
+        };
+        const result = await supervisor.spawn({
+            alias: "fast-worker",
+            role: "worker",
+            prompt: "A short task",
+            cwd: directory,
+        });
+        assert.equal(result.agent.status, "idle");
+        assert.ok(
+            store
+                .listEvents({ rootAgentId: parent.id, entityId: result.agent.id })
+                .items.some((event) => event.type === "agent.late_prompt_receipt"),
+        );
+    });
 
     beforeEach(() => {
         directory = mkdtempSync(join(tmpdir(), "pi-herdr-supervisor-"));
@@ -182,7 +210,7 @@ describe("AgentSupervisor", () => {
         assert.ok(start.args?.includes("--extension"));
         assert.ok(
             start.args?.includes(
-                "read,agent_complete,agent_mail_send,agent_mail_list,agent_mail_ack,agent_mail_sent,agent_mail_retry,agent_directory",
+                "read,agent_complete,agent_mail_send,agent_mail_list,agent_mail_read,agent_mail_ack,agent_mail_sent,agent_mail_retry,agent_directory",
             ),
         );
         assert.match(String(herdr.calls[2]?.value), /call agent_complete exactly once/u);
