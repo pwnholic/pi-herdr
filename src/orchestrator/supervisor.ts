@@ -637,7 +637,7 @@ export class AgentSupervisor {
 
     #isolatedExtensionArgs(): string[] {
         return [
-            "--no-extensions",
+            "--extensions",
             ...(this.#lifecycleExtensionPath === undefined
                 ? []
                 : ["--extension", this.#lifecycleExtensionPath]),
