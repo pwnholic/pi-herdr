@@ -73,17 +73,17 @@ one supervisor receive the same database path.
 
 ## Tools
 
-| Available to | Tools | Purpose |
-| --- | --- | --- |
-| Every agent | `agent_directory` | Discover peers by immutable ID, alias, role, and state |
-| Every agent | `agent_mail_send`, `agent_mail_list`, `agent_mail_read`, `agent_mail_ack` | Send, inspect, process, and acknowledge inbox mail |
-| Every agent | `agent_mail_sent`, `agent_mail_retry` | Inspect delivery receipts and retry eligible dead letters |
-| Workers | `agent_complete` | Declare an explicit succeeded/failed result |
-| Parent | `agent_spawn`, `agents_list`, `agent_steer`, `agent_interrupt`, `agent_resume` | Launch, discover, correct, interrupt, or resume workers |
-| Parent | `agent_rename`, `agent_stop` | Rename a worker or terminate its owned surface |
-| Parent | `workflow_start`, `workflow_status`, `workflow_list`, `workflow_cancel` | Manage persistent dependency graphs |
-| Parent | `agent_mail_dead_letters`, `agent_mail_status` | Inspect namespace delivery failures and queue health |
-| Parent | `agent_events`, `agent_diagnostics` | Inspect durable event history and runtime/database integration |
+| Available to | Tools                                                                          | Purpose                                                        |
+| ------------ | ------------------------------------------------------------------------------ | -------------------------------------------------------------- |
+| Every agent  | `agent_directory`                                                              | Discover peers by immutable ID, alias, role, and state         |
+| Every agent  | `agent_mail_send`, `agent_mail_list`, `agent_mail_read`, `agent_mail_ack`      | Send, inspect, process, and acknowledge inbox mail             |
+| Every agent  | `agent_mail_sent`, `agent_mail_retry`                                          | Inspect delivery receipts and retry eligible dead letters      |
+| Workers      | `agent_complete`                                                               | Declare an explicit succeeded/failed result                    |
+| Parent       | `agent_spawn`, `agents_list`, `agent_steer`, `agent_interrupt`, `agent_resume` | Launch, discover, correct, interrupt, or resume workers        |
+| Parent       | `agent_rename`, `agent_stop`                                                   | Rename a worker or terminate its owned surface                 |
+| Parent       | `workflow_start`, `workflow_status`, `workflow_list`, `workflow_cancel`        | Manage persistent dependency graphs                            |
+| Parent       | `agent_mail_dead_letters`, `agent_mail_status`                                 | Inspect namespace delivery failures and queue health           |
+| Parent       | `agent_events`, `agent_diagnostics`                                            | Inspect durable event history and runtime/database integration |
 
 Tool results put structured data in model-visible `content`, not only Pi's UI-only `details`.
 Large results are explicitly abbreviated; use smaller pages and returned cursors. Mail reads accept
@@ -218,32 +218,32 @@ not a complete event-sourced database backup.
 
 ### Troubleshooting
 
-| Symptom | Check |
-| --- | --- |
-| Tool name conflicts on load | Load either the installed package or one isolated development copy |
-| `MIGRATION_FAILED` | Select a fresh database or archive the superseded baseline |
-| Worker looks idle in Herdr | Inspect lifecycle integration in `agent_diagnostics`; registry and native UI are separate projections |
-| Send is queued but unprocessed | Inspect recipient state, inbox lane head, leases, TTL, and sender receipts |
-| Completion refuses success | Read and acknowledge required mail before declaring the result again |
-| Workflow cancellation reports errors | Inspect `agent_events` and let reconciliation retry the owned-surface stop |
+| Symptom                              | Check                                                                                                 |
+| ------------------------------------ | ----------------------------------------------------------------------------------------------------- |
+| Tool name conflicts on load          | Load either the installed package or one isolated development copy                                    |
+| `MIGRATION_FAILED`                   | Select a fresh database or archive the superseded baseline                                            |
+| Worker looks idle in Herdr           | Inspect lifecycle integration in `agent_diagnostics`; registry and native UI are separate projections |
+| Send is queued but unprocessed       | Inspect recipient state, inbox lane head, leases, TTL, and sender receipts                            |
+| Completion refuses success           | Read and acknowledge required mail before declaring the result again                                  |
+| Workflow cancellation reports errors | Inspect `agent_events` and let reconciliation retry the owned-surface stop                            |
 
 ## Configuration
 
-| Environment variable | Default | Meaning |
-| --- | ---: | --- |
-| `PI_HERDR_DB` | Pi session directory + `pi-herdr/control.sqlite` | Shared database |
-| `PI_HERDR_MAX_AGENTS` | `8` | Non-terminal worker limit |
-| `PI_HERDR_MAX_MESSAGE_BYTES` | `65536` | Ordinary-mail content limit |
-| `PI_HERDR_MAX_RESULT_BYTES` | `262144` | Completion limit; at most 1 MiB |
-| `PI_HERDR_MAX_PAGE_SIZE` | `100` | Page size; at most 100 |
-| `PI_HERDR_LAUNCH_TIMEOUT_MS` | `30000` | Pi readiness deadline |
-| `PI_HERDR_OPERATION_TIMEOUT_MS` | `15000` | Native operation deadline |
-| `PI_HERDR_LEASE_DURATION_MS` | `60000` | Lease duration |
-| `PI_HERDR_MESSAGE_TTL_MS` | `604800000` | Ordinary-mail TTL |
-| `PI_HERDR_COMPLETION_POLL_MS` | `500` | Inbox/workflow polling interval |
-| `PI_HERDR_MAX_DELIVERY_BYTES` | `524288` | Per-poll injection byte budget |
-| `PI_HERDR_MAILBOX_RETENTION_MS` | `2592000000` | Ordinary-mail and event retention |
-| `PI_HERDR_IDEMPOTENCY_RETENTION_MS` | `7776000000` | Replay tombstone retention |
+| Environment variable                |                                          Default | Meaning                           |
+| ----------------------------------- | -----------------------------------------------: | --------------------------------- |
+| `PI_HERDR_DB`                       | Pi session directory + `pi-herdr/control.sqlite` | Shared database                   |
+| `PI_HERDR_MAX_AGENTS`               |                                              `8` | Non-terminal worker limit         |
+| `PI_HERDR_MAX_MESSAGE_BYTES`        |                                          `65536` | Ordinary-mail content limit       |
+| `PI_HERDR_MAX_RESULT_BYTES`         |                                         `262144` | Completion limit; at most 1 MiB   |
+| `PI_HERDR_MAX_PAGE_SIZE`            |                                            `100` | Page size; at most 100            |
+| `PI_HERDR_LAUNCH_TIMEOUT_MS`        |                                          `30000` | Pi readiness deadline             |
+| `PI_HERDR_OPERATION_TIMEOUT_MS`     |                                          `15000` | Native operation deadline         |
+| `PI_HERDR_LEASE_DURATION_MS`        |                                          `60000` | Lease duration                    |
+| `PI_HERDR_MESSAGE_TTL_MS`           |                                      `604800000` | Ordinary-mail TTL                 |
+| `PI_HERDR_COMPLETION_POLL_MS`       |                                            `500` | Inbox/workflow polling interval   |
+| `PI_HERDR_MAX_DELIVERY_BYTES`       |                                         `524288` | Per-poll injection byte budget    |
+| `PI_HERDR_MAILBOX_RETENTION_MS`     |                                     `2592000000` | Ordinary-mail and event retention |
+| `PI_HERDR_IDEMPOTENCY_RETENTION_MS` |                                     `7776000000` | Replay tombstone retention        |
 
 The supervisor supplies `PI_HERDR_AGENT_ID`, `PI_HERDR_PARENT_ID`, and `PI_HERDR_RUN_ID` to
 workers. Do not handcraft those identities.
