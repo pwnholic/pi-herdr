@@ -637,7 +637,6 @@ export class AgentSupervisor {
 
     #isolatedExtensionArgs(): string[] {
         return [
-            "-ne",
             ...(this.#lifecycleExtensionPath === undefined
                 ? []
                 : ["-e", this.#lifecycleExtensionPath]),
