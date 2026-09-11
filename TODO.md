@@ -1,6 +1,6 @@
 # Pi Integration and Correctness Gaps
 
-Updated 2026-09-08.
+Updated 2026-09-11.
 
 This document tracks correctness, lifecycle, concurrency, recovery, and security-boundary gaps between `pi-herdr` and the Pi runtime.
 
@@ -23,10 +23,11 @@ A gap belongs here only when it can affect:
 
 | Priority | Gap                                                                                                                  | Severity               | Status                        |
 | -------- | -------------------------------------------------------------------------------------------------------------------- | ---------------------- | ----------------------------- |
-| P0       | `agent_settled` is too close to being treated as a global quiescence barrier                                         | **CRITICAL candidate** | Architectural                 |
+| P0       | `agent_settled` is too close to being treated as a global quiescence barrier                                         | **CRITICAL candidate** | Partially hardened; handoff remains open |
 | P0       | SQLite mailbox state and native Pi steering/follow-up queues lack an explicit fenced handoff                         | **CRITICAL candidate** | Architectural                 |
-| P0       | `agent_complete` may race with other protocol tools under parallel tool execution                                    | **CRITICAL candidate** | Requires source audit         |
-| P1       | Pi session replacement through `/new`, `/resume`, `/fork`, and `/clone` is not represented in the identity/run model | **HIGH**               | Contract gap                  |
+| P0       | Completion must freeze protocol mutations and invalidate drafts across model turns, not only agent runs             | **CRITICAL candidate** | Local guards and store ownership fencing implemented; Pi handoff open |
+| P0       | Durable execution epoch and exclusive binding                                                                       | **HIGH**               | Implemented for managed store connections; real-process tests pass |
+| P1       | Pi session replacement through `/new`, `/resume`, `/fork`, and `/clone` needs an explicit UI lifecycle policy         | **HIGH**               | Binding replacement rejected; command interception open |
 | P1       | `/reload` teardown and rebind behavior is not yet a documented invariant                                             | **HIGH**               | Contract gap                  |
 | P1       | Escape/abort semantics do not explicitly account for pending Pi-native queues                                        | **HIGH**               | Contract gap                  |
 | P1       | `steeringMode` and `followUpMode` can change assumed delivery semantics                                              | **HIGH**               | Contract gap                  |
@@ -35,6 +36,95 @@ A gap belongs here only when it can affect:
 | P2       | Session replay deduplication does not yet use the strongest available Pi-native durable primitives                   | **MEDIUM/HIGH**        | Improvement                   |
 | P2       | Pi package/dependency behavior must be audited against Bun usage and exact dependency pins                           | **MEDIUM**             | Requires `package.json` audit |
 | P2       | Shared filesystem and direct SQLite access are not a security-isolation boundary                                     | **HIGH / Security**    | Known limitation              |
+
+---
+
+## 2026-09-11 implementation checkpoint
+
+Audit baseline: commit `d18c003`; project Pi SDK pin `0.85.0`, installed Pi CLI
+`0.85.1`. Dependencies were restored with the existing frozen lockfile for a
+reproducible baseline; no dependency upgrade is claimed. MCP generation
+`2026-09-08T02:34:13Z` reported changed file metadata, so relevant implementation
+and test sources were read directly after graph discovery.
+
+Implemented in this checkpoint:
+
+- `src/pi/runtime.ts`: refuse publication and invalidate the draft when settlement
+  reports busy/pending Pi state; validate the callback's session ID.
+- `src/extension.ts`: handle `turn_start`, not just `agent_start`, so later model
+  turns inside one agent run invalidate a previous completion draft.
+- Freeze public send/read/ack/retry operations while a child completion is declared;
+  revalidate runtime ownership after asynchronous mailbox reads/acknowledgements.
+- Reject startup into a different assigned session ID and fence active operations
+  when either the registry session binding or live session manager changes.
+- Correct `agent_complete` guidance: request it alone in a tool batch. Pi's agent
+  loop executes subsequent tools even after one returns `terminate: true`, and
+  terminates the batch's continuation only when every tool result opts in.
+- Align spawn/resume test expectations with the existing supported `-ne`/`-e`
+  arguments; the initial baseline was 120 passing tests and two flag-spelling failures.
+
+Evidence and limits:
+
+- Six new runtime regression cases failed before the patch and passed afterward.
+  Additional tests cover extension event wiring and live session-manager changes.
+- Initial guard-checkpoint `bun run check`: typecheck, all 130 tests (including Pi RPC startup and
+  completion SIGKILL tests), formatting, and lint passed. This is not live managed
+  Herdr UI acceptance or proof of a complete fenced handoff.
+- A deterministic probe using Pi's actual agent loop and a fake model stream showed
+  `complete -> send -> another model turn` with only one `agent_start` event.
+- A probe of installed Pi `0.85.1`'s `sendCustomMessage` method showed a custom
+  follow-up queued directly in the agent while `pendingMessageCount` remained zero.
+  **`hasPendingMessages()` is therefore not a complete custom-message barrier.**
+- SQLite-backed probes with mocked Pi reproduced early read/ack without consumption
+  evidence and stale-runtime operations after session rebinding. Session-ID guards
+  address rebinding, not the full durable handoff or same-session concurrent owners.
+- Existing publication already uses an immediate SQLite transaction, rechecks
+  required inbox mail, and has crash/retry tests. Preserve those guarantees.
+
+### Durable execution ownership checkpoint
+
+- Added `agent_executions` in the single `pi-herdr-control-plane-v1-executions`
+  baseline: agent/run/session, monotonic epoch, unique owner, expiry. The preceding
+  `v1-runs` database is rejected, not upgraded or deleted. Stop all old processes
+  and select a fresh database; archive the old store if its data must be retained.
+- A unique root-session index prevents concurrent first starts from bypassing
+  ownership by creating separate coordinator identities for the same Pi session.
+- Parent and worker runtimes acquire exclusive ownership, renew every third of the
+  configured lease duration, and conditionally release after shutdown drains work.
+  A crash retains exclusivity until expiry; a failed renewal makes runtime health
+  sticky-failed until restart. No forced takeover of a live same-session lease.
+- Bound-store mutations validate assignment/session/epoch/owner/expiry before and
+  after work in one immediate SQLite transaction. This includes completion,
+  workflow, registry, events, and mailbox reads with maintenance side effects.
+  Release never unbinds the old connection or releases a replacement's lease.
+- Acquiring a new execution invalidates unpublished completion drafts atomically.
+  A replacement must reconsider and redeclare completion. Already-emitted results
+  keep their idempotent delivery identity and parent recovery path.
+- Storage tests exercise expiry, stale writes, conditional release, rollback at
+  acquisition, rollback on mid-write expiry, and run/session replacement. Real
+  processes exercise competing acquisition, stale send/publish/renew, SIGKILL,
+  expiry recovery, and monotonically increasing epochs. Runtime tests cover
+  duplicate startup, clean replacement, heartbeat renewal and sticky lease loss.
+- Negative control: temporarily removing both transactional ownership checks made
+  five of six execution storage tests fail; the checks were restored before the
+  final verification. The root-session uniqueness case was added afterward.
+- Final execution-checkpoint `bun run check`: typecheck, all 142 tests, formatting,
+  and lint passed with no skipped tests or lint warnings. `git diff --check` passed.
+  This includes real Pi RPC startup, not live managed Herdr UI acceptance.
+- Scope: cooperative managed processes using the bound store facade. Unbound
+  bootstrap/administrative stores and arbitrary SQLite access remain trusted.
+  Pi queue consumption and already-dispatched external actions are not fenced by
+  a SQLite epoch alone. Wall-clock changes may affect lease availability; epoch
+  equality still rejects an old owner after takeover, even with its clock behind.
+
+Next implementation slice:
+
+1. Delivery-attempt identity and Pi consumption evidence, including custom messages,
+   lease loss, reload, crash, and asynchronous injection failure.
+2. Completion barrier incorporating that evidence and broader fail-closed runtime health.
+3. Real Pi/Herdr acceptance for correction, session replacement, and reload.
+
+These are partial guards, **not closure of P0**, and not plugin/capability inheritance.
 
 ---
 
@@ -173,6 +263,11 @@ Introduce either:
 ---
 
 # 4. Execution Identity
+
+Managed store ownership is implemented in the execution checkpoint above. The
+remaining identity work concerns delivery attempts, Pi consumption evidence, and
+explicit session-command lifecycle policy; the conceptual model below is not a
+claim that every field is already persisted.
 
 `agentId + runId` alone may be insufficient when the underlying Pi session can be replaced.
 

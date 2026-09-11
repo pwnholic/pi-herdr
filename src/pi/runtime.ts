@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -103,6 +104,8 @@ export class PiHerdrRuntime {
     #workflowTimer: NodeJS.Timeout | undefined;
     #workflowTick: Promise<unknown> | undefined;
     #sessionManager: ExtensionContext["sessionManager"] | undefined;
+    #executionTimer: NodeJS.Timeout | undefined;
+    #executionFault: unknown;
 
     constructor(pi: ExtensionAPI, dependencies: RuntimeDependencies) {
         this.#pi = pi;
@@ -159,6 +162,7 @@ export class PiHerdrRuntime {
 
     async start(ctx: ExtensionContext): Promise<void> {
         await this.stop();
+        this.#executionFault = undefined;
         this.#resetTurnState();
         this.#sessionManager = ctx.sessionManager;
         const config = resolveConfig({
@@ -191,13 +195,22 @@ export class PiHerdrRuntime {
                 data: {
                     child: this.#active.child,
                     lifecycleExtension: this.#lifecycleExtensionPath !== undefined,
+                    executionEpoch: this.#active.store.execution?.epoch ?? null,
                 },
             });
             this.#active.pump.start();
             if (this.#active.workflowEngine !== undefined) this.#scheduleWorkflowTick(0);
         } catch (error) {
+            if (this.#executionTimer !== undefined) clearInterval(this.#executionTimer);
+            this.#executionTimer = undefined;
+            try {
+                store.releaseExecution();
+            } catch {
+                /* Lease expiry fences failed startup. */
+            }
             store.close();
             this.#active = undefined;
+            this.#sessionManager = undefined;
             throw error;
         }
     }
@@ -214,6 +227,13 @@ export class PiHerdrRuntime {
         this.#workflowTimer = undefined;
         if (this.#active === active) this.#active = undefined;
         this.#sessionManager = undefined;
+        if (this.#executionTimer !== undefined) clearInterval(this.#executionTimer);
+        this.#executionTimer = undefined;
+        try {
+            active.store.releaseExecution();
+        } catch (error) {
+            this.#onError(error);
+        }
         active.store.close();
         this.#resetTurnState();
     }
@@ -240,10 +260,28 @@ export class PiHerdrRuntime {
         }
     }
 
-    async onAgentSettled(_ctx: ExtensionContext): Promise<void> {
+    onTurnStart(): void {
         const active = this.#active;
         if (!active?.child) return;
         this.#requireActive();
+        // A single agent run can contain several model turns. `terminate` on
+        // one tool does not terminate a mixed tool batch in Pi.
+        active.completion?.abort();
+    }
+
+    async onAgentSettled(ctx: ExtensionContext): Promise<void> {
+        const active = this.#active;
+        if (!active?.child) return;
+        this.#requireActive();
+        if (ctx.sessionManager.getSessionId() !== active.identity.sessionId) {
+            throw new ValidationError("Settlement belongs to another Pi session");
+        }
+        // These checks are necessary, but not a durable SQLite/Pi handoff:
+        // Pi's pending-message count does not include every custom queue.
+        if (!ctx.isIdle() || ctx.hasPendingMessages()) {
+            active.completion?.abort();
+            return;
+        }
         if (active.completion?.settle()) return;
         this.#transition(
             active.store,
@@ -257,7 +295,7 @@ export class PiHerdrRuntime {
     }
 
     sendMail(input: SendMailInput) {
-        const active = this.#requireActive();
+        const active = this.#requireProtocolMutation();
         const recipient = resolveAgent(active.store, input.recipient, active.identity.rootAgentId);
         const kind = input.kind ?? "message";
         if (!PUBLIC_MESSAGE_KINDS.has(kind)) {
@@ -353,6 +391,7 @@ export class PiHerdrRuntime {
         const { store, identity, config } = this.requireParent();
         return {
             identity: { id: identity.id, runId: identity.runId },
+            execution: store.execution ?? null,
             database: { path: config.databasePath, ...store.databaseHealth() },
             extensions: {
                 path: this.#extensionPath,
@@ -372,7 +411,7 @@ export class PiHerdrRuntime {
     }
 
     retryDeadLetter(messageId: string): MailboxMessage {
-        const active = this.#requireActive();
+        const active = this.#requireProtocolMutation();
         const message = active.store.getMessage(parseMessageIdForTool(messageId));
         const parentMayOperate =
             !active.child && message.rootAgentId === active.identity.rootAgentId;
@@ -405,11 +444,14 @@ export class PiHerdrRuntime {
     }
 
     async readMail(messageId: string): Promise<MailboxMessage> {
-        const active = this.#requireActive();
+        const active = this.#requireProtocolMutation();
         const id = parseMessageIdForTool(messageId);
         const before = active.store.getMessage(id);
         this.#assertRecipient(before, active.identity.id);
         if (before.state === "queued") await active.pump.pollMessage(id);
+        if (this.#requireProtocolMutation() !== active) {
+            throw new ValidationError("Pi session changed while reading mail");
+        }
         const message = active.store.getMessage(id);
         this.#assertRecipient(message, active.identity.id);
         if (
@@ -425,8 +467,11 @@ export class PiHerdrRuntime {
     }
 
     async acknowledgeMail(messageId: string): Promise<MailboxMessage> {
-        const active = this.#requireActive();
+        const active = this.#requireProtocolMutation();
         await active.pump.pollNow();
+        if (this.#requireProtocolMutation() !== active) {
+            throw new ValidationError("Pi session changed while acknowledging mail");
+        }
         let message = active.store.getMessage(parseMessageIdForTool(messageId));
         this.#assertRecipient(message, active.identity.id);
         if (message.state === "acked") return message;
@@ -485,11 +530,23 @@ export class PiHerdrRuntime {
         if (identity.parentAgentId !== parentAgentId) {
             throw new ValidationError("Child registry parent does not match PI_HERDR_PARENT_ID");
         }
+        const sessionId = ctx.sessionManager.getSessionId();
+        if (identity.sessionId !== undefined && identity.sessionId !== sessionId) {
+            throw new ValidationError("Child Pi session does not match its assigned session");
+        }
+        if (identity.sessionId === undefined) {
+            identity = store.patchAgent({
+                agentId: identity.id,
+                patch: { sessionId },
+                expectedRevision: identity.revision,
+            });
+        }
+        this.#bindExecution(store, identity, config);
         const sessionFile = ctx.sessionManager.getSessionFile();
         identity = store.patchAgent({
             agentId: identity.id,
             patch: {
-                sessionId: ctx.sessionManager.getSessionId(),
+                sessionId,
                 ...(sessionFile === undefined ? {} : { sessionFile }),
             },
             expectedRevision: identity.revision,
@@ -527,16 +584,13 @@ export class PiHerdrRuntime {
                 ...(sessionFile === undefined ? {} : { sessionFile }),
                 metadata: { piHerdr: { coordinator: true } },
             });
-        } else {
-            identity = store.patchAgent({
-                agentId: identity.id,
-                patch: {
-                    sessionId,
-                    ...(sessionFile === undefined ? {} : { sessionFile }),
-                },
-                expectedRevision: identity.revision,
-            });
         }
+        this.#bindExecution(store, identity, config);
+        identity = store.patchAgent({
+            agentId: identity.id,
+            patch: { sessionId, ...(sessionFile === undefined ? {} : { sessionFile }) },
+            expectedRevision: identity.revision,
+        });
         if (identity.status === "registered")
             identity = this.#transition(store, identity.id, "starting");
         if (identity.status !== "idle") identity = this.#transition(store, identity.id, "idle");
@@ -636,6 +690,40 @@ export class PiHerdrRuntime {
         });
     }
 
+    #bindExecution(
+        store: SqliteControlPlaneStore,
+        identity: AgentRecord,
+        config: OrchestratorConfig,
+    ): void {
+        if (identity.sessionId === undefined)
+            throw new ValidationError("Execution requires a Pi session");
+        store.acquireExecution({
+            agentId: identity.id,
+            runId: identity.runId,
+            sessionId: identity.sessionId,
+            owner: `pi:${process.pid}:${randomUUID()}`,
+            leaseMs: config.leaseDurationMs,
+        });
+        this.#executionTimer = setInterval(
+            () => {
+                try {
+                    store.renewExecution(config.leaseDurationMs);
+                } catch (error) {
+                    // Ownership uncertainty is sticky until a new runtime starts.
+                    this.#executionFault = error;
+                    if (this.#executionTimer !== undefined) clearInterval(this.#executionTimer);
+                    this.#executionTimer = undefined;
+                    if (this.#workflowTimer !== undefined) clearTimeout(this.#workflowTimer);
+                    this.#workflowTimer = undefined;
+                    void this.#active?.pump.stop().catch(this.#onError);
+                    this.#onError(error);
+                }
+            },
+            Math.max(10, Math.floor(config.leaseDurationMs / 3)),
+        );
+        this.#executionTimer.unref();
+    }
+
     #transition(
         store: SqliteControlPlaneStore,
         agentId: AgentId,
@@ -661,13 +749,36 @@ export class PiHerdrRuntime {
         if (this.#active === undefined) {
             throw new ValidationError("Pi Herdr runtime is not active for this session");
         }
-        if (
-            this.#active.store.getAgent(this.#active.identity.id).runId !==
-            this.#active.identity.runId
-        ) {
+        if (this.#executionFault !== undefined) {
+            throw new ValidationError(
+                "Runtime execution ownership is unsafe; restart after lease recovery",
+            );
+        }
+        this.#active.store.assertExecution();
+        const current = this.#active.store.getAgent(this.#active.identity.id);
+        if (current.runId !== this.#active.identity.runId) {
             throw new ValidationError("This process belongs to a superseded assignment");
         }
+        if (
+            current.sessionId !== this.#active.identity.sessionId ||
+            this.#sessionManager?.getSessionId() !== this.#active.identity.sessionId
+        ) {
+            throw new ValidationError("This process belongs to a superseded Pi session");
+        }
         return this.#active;
+    }
+
+    #requireProtocolMutation(): ActiveResources {
+        const active = this.#requireActive();
+        if (active.child) {
+            const completion = active.store.getCompletion(active.identity.id);
+            if (completion?.runId === active.identity.runId && completion.state === "declared") {
+                throw new ValidationError(
+                    "Protocol writes are frozen after agent_complete; a new model turn must invalidate the draft first",
+                );
+            }
+        }
+        return active;
     }
 
     #requireChild(): ActiveResources {
@@ -704,7 +815,8 @@ export class PiHerdrRuntime {
     }
 
     #scheduleWorkflowTick(delay: number): void {
-        if (this.#active?.workflowEngine === undefined) return;
+        if (this.#active?.workflowEngine === undefined || this.#executionFault !== undefined)
+            return;
         this.#workflowTimer = setTimeout(() => {
             this.#workflowTimer = undefined;
             const engine = this.#active?.workflowEngine;

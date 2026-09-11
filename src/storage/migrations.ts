@@ -10,7 +10,7 @@ interface Migration {
 const MIGRATIONS: readonly Migration[] = [
     {
         version: 1,
-        name: "pi-herdr-control-plane-v1-runs",
+        name: "pi-herdr-control-plane-v1-executions",
         sql: `
         CREATE TABLE agents (
             id TEXT PRIMARY KEY,
@@ -64,6 +64,20 @@ const MIGRATIONS: readonly Migration[] = [
         CREATE UNIQUE INDEX agents_root_alias_idx ON agents (root_agent_id, alias);
 
         CREATE INDEX agents_root_created_idx ON agents (root_agent_id, created_at, id);
+
+        -- Concurrent first starts must converge on one root identity before lease binding.
+        CREATE UNIQUE INDEX agents_root_session_idx ON agents (session_id)
+        WHERE parent_agent_id IS NULL AND session_id IS NOT NULL;
+
+        CREATE TABLE agent_executions (
+            agent_id TEXT PRIMARY KEY REFERENCES agents(id) ON DELETE CASCADE,
+            run_id TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            epoch INTEGER NOT NULL CHECK (epoch > 0),
+            owner TEXT,
+            expires_at INTEGER,
+            CHECK ((owner IS NULL) = (expires_at IS NULL))
+        ) STRICT;
 
         CREATE TABLE mailbox_messages (
             sequence INTEGER PRIMARY KEY AUTOINCREMENT,

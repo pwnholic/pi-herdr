@@ -76,10 +76,17 @@ describe("durable agent registry", () => {
             INSERT INTO schema_migrations VALUES (1, 'pi-herdr-control-plane-v1', 1);
         `);
         legacy.close();
-        assert.throws(
-            () => SqliteControlPlaneStore.open({ filename }),
-            expectCode("MIGRATION_FAILED"),
-        );
+        for (const baseline of ["pi-herdr-control-plane-v1", "pi-herdr-control-plane-v1-runs"]) {
+            const history = new Database(filename);
+            history
+                .prepare("UPDATE schema_migrations SET name = ? WHERE version = 1")
+                .run(baseline);
+            history.close();
+            assert.throws(
+                () => SqliteControlPlaneStore.open({ filename }),
+                expectCode("MIGRATION_FAILED"),
+            );
+        }
     });
 
     test("persists identity and mutable recovery fields across reopen", () => {

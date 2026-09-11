@@ -28,6 +28,11 @@ import {
 } from "./completions.ts";
 import { type Clock, type OpenStoreOptions, StorageDatabase } from "./database.ts";
 import { type EventQuery, EventRepository } from "./events.ts";
+import {
+    type AcquireExecutionInput,
+    type ExecutionLease,
+    ExecutionRepository,
+} from "./executions.ts";
 import { canonicalJson } from "./json.ts";
 import {
     type ClaimMessagesInput,
@@ -51,6 +56,8 @@ import {
 
 export { LATEST_SCHEMA_VERSION } from "./migrations.ts";
 export type {
+    AcquireExecutionInput,
+    ExecutionLease,
     AgentLeaseInput,
     ClaimMessagesInput,
     Clock,
@@ -89,6 +96,7 @@ export class SqliteControlPlaneStore {
     readonly #completions: CompletionRepository;
     readonly #workflows: WorkflowRepository;
     readonly #events: EventRepository;
+    readonly #executions: ExecutionRepository;
 
     private constructor(options: OpenStoreOptions) {
         this.#database = new StorageDatabase(options);
@@ -97,6 +105,7 @@ export class SqliteControlPlaneStore {
         this.#completions = new CompletionRepository(this.#database);
         this.#workflows = new WorkflowRepository(this.#database);
         this.#events = new EventRepository(this.#database);
+        this.#executions = new ExecutionRepository(this.#database);
     }
 
     static open(options: OpenStoreOptions): SqliteControlPlaneStore {
@@ -107,12 +116,44 @@ export class SqliteControlPlaneStore {
         this.#database.close();
     }
 
+    get execution(): ExecutionLease | undefined {
+        return this.#executions.lease;
+    }
+
+    acquireExecution(input: AcquireExecutionInput): ExecutionLease {
+        return this.#executions.acquire(input);
+    }
+
+    renewExecution(leaseMs: number): ExecutionLease {
+        return this.#executions.renew(leaseMs);
+    }
+
+    releaseExecution(): boolean {
+        return this.#executions.release();
+    }
+
+    assertExecution(): void {
+        this.#database.connection.transaction(() => this.#executions.assertCurrent()).immediate();
+    }
+
+    #write<T>(operation: () => T): T {
+        return this.#database.connection
+            .transaction(() => {
+                this.#executions.assertCurrent();
+                const result = operation();
+                // Fail closed if a long synchronous operation outlives its lease.
+                this.#executions.assertCurrent();
+                return result;
+            })
+            .immediate();
+    }
+
     listEvents(input: EventQuery) {
         return this.#events.list(input);
     }
 
     recordEvent(input: Parameters<EventRepository["append"]>[0]): void {
-        this.#events.append(input);
+        this.#write(() => this.#events.append(input));
     }
 
     databaseHealth() {
@@ -131,11 +172,11 @@ export class SqliteControlPlaneStore {
     }
 
     requestWorkflowCancellation(workflowId: WorkflowId, rootAgentId: AgentId): WorkflowRecord {
-        return this.#workflows.requestCancellation(workflowId, rootAgentId);
+        return this.#write(() => this.#workflows.requestCancellation(workflowId, rootAgentId));
     }
 
     registerAgent(input: RegisterAgentInput): AgentRecord {
-        return this.#agents.register(input);
+        return this.#write(() => this.#agents.register(input));
     }
 
     getAgent(agentId: AgentId): AgentRecord {
@@ -151,79 +192,79 @@ export class SqliteControlPlaneStore {
     }
 
     renameAgent(input: RenameAgentInput): AgentRecord {
-        return this.#agents.rename(input);
+        return this.#write(() => this.#agents.rename(input));
     }
 
     patchAgent(input: PatchAgentInput): AgentRecord {
-        return this.#agents.patch(input);
+        return this.#write(() => this.#agents.patch(input));
     }
 
     transitionAgent(input: TransitionAgentInput): AgentRecord {
-        return this.#agents.transition(input);
+        return this.#write(() => this.#agents.transition(input));
     }
 
     deleteAgent(agentId: AgentId, expectedRevision: number): void {
-        this.#agents.delete(agentId, expectedRevision);
+        this.#write(() => this.#agents.delete(agentId, expectedRevision));
     }
 
     acquireAgentLease(input: AgentLeaseInput): AgentRecord {
-        return this.#agents.acquireLease(input);
+        return this.#write(() => this.#agents.acquireLease(input));
     }
 
     renewAgentLease(input: AgentLeaseInput): AgentRecord {
-        return this.#agents.renewLease(input);
+        return this.#write(() => this.#agents.renewLease(input));
     }
 
     releaseAgentLease(agentId: AgentId, owner: string): AgentRecord {
-        return this.#agents.releaseLease(agentId, owner);
+        return this.#write(() => this.#agents.releaseLease(agentId, owner));
     }
 
     enqueueMessage(input: EnqueueMessageInput): EnqueueResult {
-        return this.#mailbox.enqueue(input);
+        return this.#write(() => this.#mailbox.enqueue(input));
     }
 
     getMessage(messageId: MessageId): MailboxMessage {
-        return this.#mailbox.get(messageId);
+        return this.#write(() => this.#mailbox.get(messageId));
     }
 
     listMessages(filter: MailboxFilter): MessagePage {
-        return this.#mailbox.list(filter);
+        return this.#write(() => this.#mailbox.list(filter));
     }
 
     listSentMessages(filter: OutboxFilter): MessagePage {
-        return this.#mailbox.listSent(filter);
+        return this.#write(() => this.#mailbox.listSent(filter));
     }
 
     requeueDeadLetterMessage(input: RequeueDeadLetterInput): MailboxMessage {
-        return this.#mailbox.requeueDeadLetter(input);
+        return this.#write(() => this.#mailbox.requeueDeadLetter(input));
     }
 
     claimMessages(input: ClaimMessagesInput): readonly MailboxMessage[] {
-        return this.#mailbox.claim(input);
+        return this.#write(() => this.#mailbox.claim(input));
     }
 
     markMessageRead(input: MessageMutationInput): MailboxMessage {
-        return this.#mailbox.markRead(input);
+        return this.#write(() => this.#mailbox.markRead(input));
     }
 
     acknowledgeMessage(input: MessageMutationInput): MailboxMessage {
-        return this.#mailbox.acknowledge(input);
+        return this.#write(() => this.#mailbox.acknowledge(input));
     }
 
     renewMessageLease(input: RenewMessageLeaseInput): MailboxMessage {
-        return this.#mailbox.renewLease(input);
+        return this.#write(() => this.#mailbox.renewLease(input));
     }
 
     retryMessage(input: RetryMessageInput): MailboxMessage {
-        return this.#mailbox.retry(input);
+        return this.#write(() => this.#mailbox.retry(input));
     }
 
     deadLetterMessage(input: DeadLetterMessageInput): MailboxMessage {
-        return this.#mailbox.deadLetter(input);
+        return this.#write(() => this.#mailbox.deadLetter(input));
     }
 
     runMailboxMaintenance(): MaintenanceResult {
-        return this.#mailbox.runMaintenance();
+        return this.#write(() => this.#mailbox.runMaintenance());
     }
 
     listDeadLetters(input: ListNamespaceMessagesInput): MessagePage {
@@ -235,12 +276,14 @@ export class SqliteControlPlaneStore {
     }
 
     unresolvedRequiredMessages(agentId: AgentId, limit?: number): readonly MailboxMessage[] {
-        return this.#mailbox.unresolvedRequired(agentId, limit);
+        return this.#write(() => this.#mailbox.unresolvedRequired(agentId, limit));
     }
 
     pruneMailbox(input: PruneMessagesInput): PruneMessagesResult {
-        this.#events.prune(input.retentionMs, input.limit);
-        return this.#mailbox.prune(input);
+        return this.#write(() => {
+            this.#events.prune(input.retentionMs, input.limit);
+            return this.#mailbox.prune(input);
+        });
     }
 
     getCompletion(agentId: AgentId): CompletionOutboxRecord | undefined {
@@ -248,70 +291,66 @@ export class SqliteControlPlaneStore {
     }
 
     declareCompletion(input: DeclareCompletionInput): CompletionOutboxRecord {
-        return this.#completions.declare(input);
+        return this.#write(() => this.#completions.declare(input));
     }
 
     /** Frozen declaration, mailbox envelope, and publication marker commit together. */
     publishCompletion(agentId: AgentId, runId: string, token: string): MailboxMessage {
-        return this.#database.connection
-            .transaction(() => {
-                const agent = this.#agents.get(agentId);
-                const declaration = this.#completions.get(agentId);
-                if (
-                    agent.runId !== runId ||
-                    declaration?.runId !== runId ||
-                    declaration.invocationToken !== token ||
-                    agent.parentAgentId === undefined
-                ) {
-                    throw new ValidationError(
-                        "Completion does not belong to the active assignment",
-                    );
-                }
-                if (declaration.messageId !== undefined && declaration.state !== "invalidated") {
-                    return this.#mailbox.get(declaration.messageId);
-                }
-                if (declaration.state !== "declared")
-                    throw new ValidationError("Completion is not declared");
-                const payload = declaration.payload as { status?: unknown };
-                if (payload.status !== "succeeded" && payload.status !== "failed")
-                    throw new ValidationError("Invalid completion status");
-                if (
-                    payload.status === "succeeded" &&
-                    this.#mailbox.unresolvedRequired(agent.id).length > 0
-                ) {
-                    throw new ValidationError(
-                        "Cannot publish completion with unresolved required mail",
-                    );
-                }
-                const delivery = this.#mailbox.enqueue({
-                    senderAgentId: agent.id,
-                    senderRunId: runId,
-                    recipientAgentId: agent.parentAgentId,
-                    kind: "result",
-                    content: canonicalJson(declaration.payload),
-                    metadata: {
-                        action: "completion",
-                        agentId,
-                        runId,
-                        status: payload.status,
-                        completionToken: token,
-                    },
-                    idempotencyKey: `completion:${createHash("sha256").update(`${agentId}:${runId}:${token}`).digest("hex")}`,
+        return this.#write(() => {
+            const agent = this.#agents.get(agentId);
+            const declaration = this.#completions.get(agentId);
+            if (
+                agent.runId !== runId ||
+                declaration?.runId !== runId ||
+                declaration.invocationToken !== token ||
+                agent.parentAgentId === undefined
+            ) {
+                throw new ValidationError("Completion does not belong to the active assignment");
+            }
+            if (declaration.messageId !== undefined && declaration.state !== "invalidated") {
+                return this.#mailbox.get(declaration.messageId);
+            }
+            if (declaration.state !== "declared")
+                throw new ValidationError("Completion is not declared");
+            const payload = declaration.payload as { status?: unknown };
+            if (payload.status !== "succeeded" && payload.status !== "failed")
+                throw new ValidationError("Invalid completion status");
+            if (
+                payload.status === "succeeded" &&
+                this.#mailbox.unresolvedRequired(agent.id).length > 0
+            ) {
+                throw new ValidationError(
+                    "Cannot publish completion with unresolved required mail",
+                );
+            }
+            const delivery = this.#mailbox.enqueue({
+                senderAgentId: agent.id,
+                senderRunId: runId,
+                recipientAgentId: agent.parentAgentId,
+                kind: "result",
+                content: canonicalJson(declaration.payload),
+                metadata: {
+                    action: "completion",
+                    agentId,
+                    runId,
+                    status: payload.status,
+                    completionToken: token,
+                },
+                idempotencyKey: `completion:${createHash("sha256").update(`${agentId}:${runId}:${token}`).digest("hex")}`,
+            });
+            this.#database.hit("completion.publish.after_enqueue", { agentId, runId });
+            this.#completions.markEmitted(agentId, token, delivery.message.id);
+            const status = payload.status === "succeeded" ? "completed" : "failed";
+            if (agent.status !== status)
+                this.#agents.transition({
+                    agentId,
+                    status,
+                    expectedRevision: agent.revision,
+                    patch: {},
                 });
-                this.#database.hit("completion.publish.after_enqueue", { agentId, runId });
-                this.#completions.markEmitted(agentId, token, delivery.message.id);
-                const status = payload.status === "succeeded" ? "completed" : "failed";
-                if (agent.status !== status)
-                    this.#agents.transition({
-                        agentId,
-                        status,
-                        expectedRevision: agent.revision,
-                        patch: {},
-                    });
-                this.#database.hit("completion.publish.before_commit", { agentId, runId });
-                return delivery.message;
-            })
-            .immediate();
+            this.#database.hit("completion.publish.before_commit", { agentId, runId });
+            return delivery.message;
+        });
     }
 
     markCompletionEmitted(
@@ -319,11 +358,13 @@ export class SqliteControlPlaneStore {
         invocationToken: string,
         messageId: MessageId,
     ): CompletionOutboxRecord {
-        return this.#completions.markEmitted(agentId, invocationToken, messageId);
+        return this.#write(() =>
+            this.#completions.markEmitted(agentId, invocationToken, messageId),
+        );
     }
 
     markCompletionParentApplied(agentId: AgentId, invocationToken: string): CompletionOutboxRecord {
-        return this.#completions.markParentApplied(agentId, invocationToken);
+        return this.#write(() => this.#completions.markParentApplied(agentId, invocationToken));
     }
 
     markCompletionAcknowledged(
@@ -331,11 +372,13 @@ export class SqliteControlPlaneStore {
         invocationToken: string,
         messageId: MessageId,
     ): CompletionOutboxRecord {
-        return this.#completions.markAcknowledged(agentId, invocationToken, messageId);
+        return this.#write(() =>
+            this.#completions.markAcknowledged(agentId, invocationToken, messageId),
+        );
     }
 
     invalidateCompletion(agentId: AgentId, invocationToken: string): CompletionOutboxRecord {
-        return this.#completions.invalidate(agentId, invocationToken);
+        return this.#write(() => this.#completions.invalidate(agentId, invocationToken));
     }
 
     listPendingCompletions(parentAgentId: AgentId): readonly CompletionOutboxRecord[] {
@@ -343,15 +386,15 @@ export class SqliteControlPlaneStore {
     }
 
     beginMailboxEffect(messageId: MessageId, effect: string): MailboxEffectRecord {
-        return this.#completions.beginEffect(messageId, effect);
+        return this.#write(() => this.#completions.beginEffect(messageId, effect));
     }
 
     advanceMailboxEffect(messageId: MessageId, state: MailboxEffectState): MailboxEffectRecord {
-        return this.#completions.advanceEffect(messageId, state);
+        return this.#write(() => this.#completions.advanceEffect(messageId, state));
     }
 
     createWorkflow(input: CreateWorkflowInput): WorkflowRecord {
-        return this.#workflows.create(input);
+        return this.#write(() => this.#workflows.create(input));
     }
 
     getWorkflow(workflowId: WorkflowId, rootAgentId: AgentId): WorkflowRecord {
@@ -363,10 +406,10 @@ export class SqliteControlPlaneStore {
     }
 
     transitionWorkflow(input: TransitionWorkflowInput): WorkflowRecord {
-        return this.#workflows.transition(input);
+        return this.#write(() => this.#workflows.transition(input));
     }
 
     updateWorkflowNode(input: UpdateWorkflowNodeInput): WorkflowRecord {
-        return this.#workflows.updateNode(input);
+        return this.#write(() => this.#workflows.updateNode(input));
     }
 }

@@ -511,11 +511,11 @@ export function registerPiHerdrTools(
             name: "agent_complete",
             label: "Complete assigned work",
             description:
-                "Worker-only final result declaration, not a progress update. Use status=succeeded only when assigned work and required mail are handled; status=failed reports a terminal failure. Persists a frozen result and terminates the current tool batch; publication follows Pi settlement. An interrupted or superseded declaration must be reconsidered before redeclaring.",
+                "Worker-only final result declaration, not a progress update. Use status=succeeded only when assigned work and required mail are handled; status=failed reports a terminal failure. Call this alone in its tool batch. Persists a frozen result and requests termination; publication requires eligible Pi settlement. An interrupted, superseded, or later-turn-invalidated declaration must be reconsidered before redeclaring.",
             promptSnippet: "Finish a worker assignment with an explicit durable result.",
             promptGuidelines: [
                 "Before agent_complete, inspect agent_mail_list and handle/ack required instructions; report the actual summary and artifact paths, not just an intention to work.",
-                "Use agent_mail_send for progress or peer responses; use agent_complete only for the final assignment result, and do not schedule more work in the same batch afterward.",
+                "Use agent_mail_send for progress or peer responses before completion. Call agent_complete alone in its batch: Pi may execute other tools in a mixed batch despite its termination request. Protocol writes are frozen after declaration until a new model turn invalidates the draft.",
             ],
             parameters: Type.Object(
                 {

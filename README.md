@@ -65,7 +65,8 @@ require a managed Herdr environment.
 
 This rewrite intentionally has one schema baseline, not a chain of compatibility migrations.
 Older development databases, including earlier variants of schema version 1, fail with
-`MIGRATION_FAILED`.
+`MIGRATION_FAILED`. The current baseline is `pi-herdr-control-plane-v1-executions`;
+the preceding `pi-herdr-control-plane-v1-runs` baseline is also incompatible.
 
 Use a fresh `PI_HERDR_DB` path, or archive the old development database while all users of it are
 stopped. The extension never deletes an existing database automatically. All workers launched by
@@ -147,6 +148,7 @@ recipient. Mail to completed/failed workers is rejected. Alias changes do not ch
 ### Completion and recovery
 
 A worker calls `agent_complete` with a status, summary, and optional details/artifact references.
+Call it alone in its tool batch, after finishing mailbox replies and acknowledgements.
 The validated payload is persisted before the tool returns. It is not rebuilt from transient final
 assistant text.
 
@@ -154,10 +156,27 @@ After Pi emits `agent_settled`, one SQLite transaction publishes the frozen resu
 outbox emitted, and advances worker status. Success is refused while required mail remains
 unresolved, including mail arriving after declaration. Aborting or beginning another reasoning
 turn invalidates an unpublished declaration.
+Settlement reported while Pi is busy or reports pending messages also invalidates the draft.
+Public send/read/ack/retry operations are frozen while a completion draft is declared.
+Managed workers reject a Pi session ID different from their existing registry binding.
+
+Each managed parent or worker binds its store connection to a durable execution identity:
+agent ID, run ID, Pi session ID, monotonic epoch, and unique process owner. A live lease prevents
+a second process from binding the same assignment/session. Every store mutation checks ownership
+inside its SQLite transaction, including mailbox reads that perform expiry maintenance. Once a
+replacement acquires ownership, the old connection cannot write, renew, or release the new lease.
+
+Runtime heartbeats renew the lease every third of `PI_HERDR_LEASE_DURATION_MS` (default: 60 seconds).
+Clean shutdown releases ownership after draining runtime work. A crash requires waiting for lease
+expiry before retrying startup; renewal failure stops background scheduling and rejects active
+operations until restart. These are cooperative managed-process guards, not isolation from trusted
+administrative stores, arbitrary SQLite writers, or already-dispatched external Pi/Herdr actions.
 
 The parent journals result application before notifying Pi and acknowledging the message.
-Completion messages do not inherit ordinary-mail TTL. A restart can retry publication or resume
-parent handling without generating a different completion payload.
+Completion messages do not inherit ordinary-mail TTL. A replacement execution invalidates an
+unpublished draft and requires a new `agent_complete` declaration. Already-emitted results retain
+their delivery identity, so the parent can resume handling without generating a different
+completion payload.
 
 SQLite, Pi session persistence, and Herdr do not share a transaction. Session-history replay
 checks reduce duplicate injections, but this is not a universal exactly-once guarantee for

@@ -200,14 +200,14 @@ describe("AgentSupervisor", () => {
         );
         const start = herdr.calls[1]?.value as StartPiOptions;
         assert.deepEqual(start.args?.slice(0, 5), [
-            "--no-extensions",
-            "--extension",
+            "-ne",
+            "-e",
             "/herdr-agent-state.ts",
-            "--extension",
+            "-e",
             "/extension.ts",
         ]);
         assert.ok(start.args?.includes("--session-id"));
-        assert.ok(start.args?.includes("--extension"));
+        assert.ok(start.args?.includes("-e"));
         assert.ok(
             start.args?.includes(
                 "read,agent_complete,agent_mail_send,agent_mail_list,agent_mail_read,agent_mail_ack,agent_mail_sent,agent_mail_retry,agent_directory",
@@ -447,10 +447,10 @@ describe("AgentSupervisor", () => {
         assert.ok(resumedStart);
         const resumedArgs = (resumedStart.value as StartPiOptions).args;
         assert.deepEqual(resumedArgs?.slice(0, 5), [
-            "--no-extensions",
-            "--extension",
+            "-ne",
+            "-e",
             "/herdr-agent-state.ts",
-            "--extension",
+            "-e",
             "/extension.ts",
         ]);
         assert.ok(resumedArgs?.includes(sessionFile));

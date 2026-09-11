@@ -10,6 +10,7 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import type { AgentRecord } from "../../src/domain/agent.ts";
 import type { AgentId } from "../../src/domain/ids.ts";
+import { registerPiHerdrExtension } from "../../src/extension.ts";
 import { DeterministicFailpoints } from "../../src/faults.ts";
 import { PiHerdrRuntime } from "../../src/pi/runtime.ts";
 import { registerPiHerdrTools } from "../../src/pi/tools.ts";
@@ -56,6 +57,8 @@ function fixture() {
     } as unknown as ExtensionAPI;
     const context = {
         cwd: directory,
+        isIdle: () => true,
+        hasPendingMessages: () => false,
         sessionManager: {
             getSessionDir: () => directory,
             getSessionId: () => "44444444-4444-4444-8444-444444444444",
@@ -106,6 +109,235 @@ function assistantEvent(stopReason: "stop" | "aborted", text = "final answer"): 
 function current(store: SqliteControlPlaneStore, agent: AgentRecord): AgentRecord {
     return store.getAgent(agent.id);
 }
+
+test("a duplicate runtime cannot alter an active binding; clean stop permits replacement", async () => {
+    const f = fixture();
+    const replacement = new PiHerdrRuntime(f.pi, {
+        extensionPath: join(f.directory, "extension.ts"),
+        environment: {
+            PI_HERDR_AGENT_ID: f.child.id,
+            PI_HERDR_PARENT_ID: f.parent.id,
+            PI_HERDR_DB: f.filename,
+        },
+    });
+    try {
+        await f.runtime.start(f.context);
+        const before = f.setupStore.getAgent(f.child.id);
+        await assert.rejects(replacement.start(f.context), /execution/);
+        assert.deepEqual(f.setupStore.getAgent(f.child.id), before);
+        f.runtime.onAgentStart();
+        await f.runtime.stop();
+        await replacement.start(f.context);
+        replacement.onAgentStart();
+        assert.equal(f.setupStore.getAgent(f.child.id).status, "running");
+    } finally {
+        await f.runtime.stop();
+        await replacement.stop();
+        f.setupStore.close();
+    }
+});
+
+test("runtime heartbeat renews ownership and lease loss stays failed closed until restart", async (t) => {
+    const f = fixture();
+    let now = 1000;
+    let bound: SqliteControlPlaneStore | undefined;
+    const errors: unknown[] = [];
+    t.mock.timers.enable({ apis: ["setInterval"] });
+    const runtime = new PiHerdrRuntime(f.pi, {
+        extensionPath: join(f.directory, "extension.ts"),
+        environment: {
+            PI_HERDR_AGENT_ID: f.child.id,
+            PI_HERDR_PARENT_ID: f.parent.id,
+            PI_HERDR_DB: f.filename,
+            PI_HERDR_COMPLETION_POLL_MS: "60000",
+        },
+        openStore: (filename) => {
+            bound = SqliteControlPlaneStore.open({ filename, clock: { now: () => now } });
+            return bound;
+        },
+        onError: (error) => errors.push(error),
+    });
+    try {
+        await runtime.start(f.context);
+        assert.equal(bound?.execution?.expiresAt, 61000);
+        now = 21000;
+        t.mock.timers.tick(20000);
+        assert.equal(bound?.execution?.expiresAt, 81000);
+        now = 81000;
+        t.mock.timers.tick(20000);
+        assert.match(String(errors[0]), /execution/);
+        now = 21000; // Clock recovery must not silently restore runtime authority.
+        assert.throws(() => runtime.onAgentStart(), /ownership is unsafe/);
+        await runtime.stop();
+        await runtime.start(f.context);
+        assert.equal(bound?.execution?.epoch, 2);
+        runtime.onAgentStart();
+    } finally {
+        await runtime.stop();
+        t.mock.timers.reset();
+        f.setupStore.close();
+    }
+});
+
+for (const condition of ["busy", "pending"] as const) {
+    test(`settlement rejects a completion draft when Pi is ${condition}`, async () => {
+        const { runtime, context, setupStore, child, parent } = fixture();
+        try {
+            await runtime.start(context);
+            runtime.onAgentStart();
+            runtime.declareCompletion({ status: "succeeded", summary: "premature" }, "draft");
+            await runtime.onAgentSettled({
+                ...context,
+                isIdle: () => condition !== "busy",
+                hasPendingMessages: () => condition === "pending",
+            });
+            assert.equal(setupStore.getCompletion(child.id)?.state, "invalidated");
+            assert.equal(setupStore.listMessages({ recipientAgentId: parent.id }).items.length, 0);
+        } finally {
+            await runtime.stop();
+            setupStore.close();
+        }
+    });
+}
+
+test("a later model turn in the same agent run invalidates the completion draft", async () => {
+    const { runtime, context, setupStore, child, parent } = fixture();
+    try {
+        await runtime.start(context);
+        runtime.onAgentStart();
+        runtime.declareCompletion({ status: "succeeded", summary: "old turn" }, "draft");
+        runtime.onTurnStart();
+        await runtime.onAgentSettled(context);
+        assert.equal(setupStore.getCompletion(child.id)?.state, "invalidated");
+        assert.equal(setupStore.listMessages({ recipientAgentId: parent.id }).items.length, 0);
+        runtime.declareCompletion({ status: "succeeded", summary: "revised" }, "new-draft");
+        await runtime.onAgentSettled(context);
+        assert.equal(setupStore.getCompletion(child.id)?.state, "emitted");
+    } finally {
+        await runtime.stop();
+        setupStore.close();
+    }
+});
+
+test("child startup refuses to replace an assigned Pi session binding", async () => {
+    const { runtime, context, setupStore, child } = fixture();
+    const assigned = "77777777-7777-4777-8777-777777777777";
+    setupStore.patchAgent({
+        agentId: child.id,
+        patch: { sessionId: assigned },
+        expectedRevision: child.revision,
+    });
+    try {
+        await assert.rejects(runtime.start(context), /session/i);
+        assert.equal(setupStore.getAgent(child.id).sessionId, assigned);
+    } finally {
+        await runtime.stop();
+        setupStore.close();
+    }
+});
+
+test("a changed session binding fences an already running child", async () => {
+    const { runtime, context, setupStore, child, parent } = fixture();
+    try {
+        await runtime.start(context);
+        const bound = setupStore.getAgent(child.id);
+        setupStore.patchAgent({
+            agentId: child.id,
+            patch: { sessionId: "77777777-7777-4777-8777-777777777777" },
+            expectedRevision: bound.revision,
+        });
+        assert.throws(
+            () => runtime.sendMail({ recipient: parent.id, content: "stale" }),
+            /session/i,
+        );
+        await assert.rejects(runtime.onAgentSettled(context), /session/i);
+    } finally {
+        await runtime.stop();
+        setupStore.close();
+    }
+});
+
+test("protocol writes are frozen after completion declaration until the next model turn", async () => {
+    const { runtime, context, setupStore, parent } = fixture();
+    try {
+        await runtime.start(context);
+        runtime.onAgentStart();
+        runtime.declareCompletion({ status: "succeeded", summary: "done" }, "draft");
+        assert.throws(() => runtime.sendMail({ recipient: parent.id, content: "late" }), /frozen/i);
+        assert.throws(() => runtime.retryDeadLetter(parent.id), /frozen/i);
+        await assert.rejects(runtime.readMail(parent.id), /frozen/i);
+        await assert.rejects(runtime.acknowledgeMail(parent.id), /frozen/i);
+        runtime.onTurnStart();
+        assert.doesNotThrow(() => runtime.sendMail({ recipient: parent.id, content: "new turn" }));
+    } finally {
+        await runtime.stop();
+        setupStore.close();
+    }
+});
+
+test("extension turn_start wiring invalidates a draft inside the same agent run", async () => {
+    const base = fixture();
+    const handlers = new Map<string, (event: unknown, ctx: ExtensionContext) => unknown>();
+    const runtime = registerPiHerdrExtension(
+        {
+            ...base.pi,
+            registerTool: () => undefined,
+            on: (name: string, handler: (event: unknown, ctx: ExtensionContext) => unknown) => {
+                handlers.set(name, handler);
+            },
+        } as unknown as ExtensionAPI,
+        {
+            extensionPath: join(base.directory, "extension.ts"),
+            environment: {
+                PI_HERDR_AGENT_ID: base.child.id,
+                PI_HERDR_PARENT_ID: base.parent.id,
+                PI_HERDR_RUN_ID: base.child.runId,
+                PI_HERDR_DB: base.filename,
+                PI_HERDR_COMPLETION_POLL_MS: "60000",
+            },
+        },
+    );
+    try {
+        await handlers.get("session_start")!({}, base.context);
+        await handlers.get("agent_start")!({}, base.context);
+        runtime.declareCompletion({ status: "succeeded", summary: "draft" }, "draft");
+        assert.ok(handlers.has("turn_start"));
+        await handlers.get("turn_start")!({}, base.context);
+        await handlers.get("agent_settled")!({}, base.context);
+        assert.equal(base.setupStore.getCompletion(base.child.id)?.state, "invalidated");
+        assert.equal(
+            base.setupStore.listMessages({ recipientAgentId: base.parent.id }).items.length,
+            0,
+        );
+    } finally {
+        await runtime.stop();
+        base.setupStore.close();
+    }
+});
+
+test("session-manager replacement fences child tools before the registry changes", async () => {
+    const { runtime, context, setupStore, parent } = fixture();
+    let sessionId = context.sessionManager.getSessionId();
+    const mutableContext = {
+        ...context,
+        sessionManager: { ...context.sessionManager, getSessionId: () => sessionId },
+    } as ExtensionContext;
+    try {
+        await runtime.start(mutableContext);
+        sessionId = "77777777-7777-4777-8777-777777777777";
+        assert.throws(
+            () => runtime.sendMail({ recipient: parent.id, content: "stale" }),
+            /session/i,
+        );
+        assert.throws(
+            () => runtime.declareCompletion({ status: "succeeded", summary: "stale" }, "stale"),
+            /session/i,
+        );
+    } finally {
+        await runtime.stop();
+        setupStore.close();
+    }
+});
 
 test("an aborted last assistant turn invalidates pending completion and stays alive", async () => {
     const { runtime, context, setupStore, child, parent } = fixture();
@@ -249,7 +481,7 @@ test("child registration exposes completion but not parent control tools", () =>
     assert.equal(definitions.length, names.length);
 });
 
-test("agent_complete binds idempotency to its tool call and terminates the batch", async () => {
+test("agent_complete binds idempotency to its tool call and requests batch termination", async () => {
     const definitions: Array<{ name: string; execute: (...args: never[]) => unknown }> = [];
     let observedToken: string | undefined;
     const pi = {
@@ -499,7 +731,7 @@ test("distinct completion invocation tokens permit a later resumed assignment", 
     setupStore.close();
 });
 
-test("restores a declared completion after child runtime replacement", async () => {
+test("replacement execution invalidates an unpublished draft and requires a new declaration", async () => {
     const { runtime, context, setupStore, child, parent, filename, directory, pi } = fixture();
     await runtime.start(context);
     runtime.onAgentStart();
@@ -516,7 +748,12 @@ test("restores a declared completion after child runtime replacement", async () 
         },
     });
     await restarted.start(context);
+    assert.equal(setupStore.getCompletion(child.id)?.state, "invalidated");
     restarted.onAgentEnd(assistantEvent("stop"));
+    await restarted.onAgentSettled(context);
+    assert.equal(setupStore.listMessages({ recipientAgentId: parent.id }).items.length, 0);
+    restarted.onAgentStart();
+    restarted.declareCompletion({ status: "succeeded", summary: "revalidated" }, "new-epoch-token");
     await restarted.onAgentSettled(context);
 
     const results = setupStore.listMessages({ recipientAgentId: parent.id }).items;
