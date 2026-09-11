@@ -52,6 +52,112 @@ function fixture() {
     };
 }
 
+test("durable Pi handoff fences read, ack and completion until context observation", () => {
+    const f = fixture();
+    try {
+        const worker = f.open();
+        worker.acquireExecution({ ...f.input, owner: "runtime" });
+        const mail = f.admin.enqueueMessage({
+            senderAgentId: f.parent.id,
+            recipientAgentId: f.child.id,
+            kind: "message",
+            content: "context evidence",
+        }).message;
+        const [claimed] = worker.claimMessages({
+            recipientAgentId: f.child.id,
+            owner: "pump",
+            leaseMs: 50,
+            limit: 1,
+        });
+        assert.ok(claimed);
+        worker.declareCompletion({
+            agentId: f.child.id,
+            invocationToken: "draft",
+            payload: { status: "succeeded", summary: "old" },
+        });
+        assert.throws(() => worker.beginPiHandoff(mail.id, "someone-else"), /ownership/);
+        const handoff = worker.beginPiHandoff(mail.id, "pump");
+        assert.equal(f.admin.getCompletion(f.child.id)?.state, "invalidated");
+        assert.equal(worker.beginPiHandoff(mail.id, "pump").created, false);
+        const mutation = {
+            messageId: mail.id,
+            recipientAgentId: f.child.id,
+            owner: "pump",
+            expectedRevision: claimed.revision,
+        };
+        assert.throws(() => worker.markMessageRead(mutation), /not been observed/);
+        assert.throws(() => worker.acknowledgeMessage(mutation), /not been observed/);
+        assert.throws(
+            () =>
+                worker.declareCompletion({
+                    agentId: f.child.id,
+                    invocationToken: "new",
+                    payload: {},
+                }),
+            /awaits context/,
+        );
+        assert.throws(
+            () => worker.publishCompletion(f.child.id, f.child.runId, "draft"),
+            /awaits context/,
+        );
+        assert.equal(worker.observePiHandoff(mail.id, "forged"), false);
+        assert.equal(worker.observePiHandoff(mail.id, handoff.token), true);
+        assert.equal(worker.observePiHandoff(mail.id, handoff.token), false);
+        const read = worker.markMessageRead(mutation);
+        assert.equal(
+            worker.acknowledgeMessage({ ...mutation, expectedRevision: read.revision }).state,
+            "acked",
+        );
+        worker.declareCompletion({
+            agentId: f.child.id,
+            invocationToken: "new",
+            payload: { status: "succeeded", summary: "context seen" },
+        });
+        assert.equal(worker.publishCompletion(f.child.id, f.child.runId, "new").kind, "result");
+    } finally {
+        f.close();
+    }
+});
+
+test("replacement epoch rejects old handoff tokens and expired mailbox ownership", () => {
+    const f = fixture();
+    try {
+        const a = f.open(),
+            b = f.open();
+        a.acquireExecution({ ...f.input, owner: "a" });
+        const mail = f.admin.enqueueMessage({
+            senderAgentId: f.parent.id,
+            recipientAgentId: f.child.id,
+            kind: "message",
+            content: "restart",
+        }).message;
+        a.claimMessages({ recipientAgentId: f.child.id, owner: "pump-a", leaseMs: 50, limit: 1 });
+        const old = a.beginPiHandoff(mail.id, "pump-a");
+        f.advance(50);
+        assert.throws(() => a.observePiHandoff(mail.id, old.token), /ownership/);
+        f.advance(50);
+        b.acquireExecution({ ...f.input, owner: "b" });
+        b.claimMessages({ recipientAgentId: f.child.id, owner: "pump-b", leaseMs: 50, limit: 1 });
+        assert.throws(
+            () =>
+                b.declareCompletion({
+                    agentId: f.child.id,
+                    invocationToken: "premature-restart",
+                    payload: {},
+                }),
+            /awaits context/,
+        );
+        const replacement = b.beginPiHandoff(mail.id, "pump-b");
+        assert.notEqual(replacement.token, old.token);
+        assert.equal(replacement.epoch, 2);
+        assert.equal(b.observePiHandoff(mail.id, old.token), false);
+        assert.throws(() => a.observePiHandoff(mail.id, old.token), /execution/);
+        assert.equal(b.observePiHandoff(mail.id, replacement.token), true);
+    } finally {
+        f.close();
+    }
+});
+
 test("a Pi session cannot bootstrap two root identities and bypass execution exclusivity", () => {
     const f = fixture();
     try {

@@ -10,7 +10,7 @@ interface Migration {
 const MIGRATIONS: readonly Migration[] = [
     {
         version: 1,
-        name: "pi-herdr-control-plane-v1-executions",
+        name: "pi-herdr-control-plane-v1-handoffs",
         sql: `
         CREATE TABLE agents (
             id TEXT PRIMARY KEY,
@@ -171,6 +171,18 @@ const MIGRATIONS: readonly Migration[] = [
             lease_expires_at IS NOT NULL;
 
         CREATE INDEX mailbox_root_state_idx ON mailbox_messages (root_agent_id, state, sequence);
+
+        CREATE TABLE mailbox_pi_handoffs (
+            message_id TEXT PRIMARY KEY REFERENCES mailbox_messages(id) ON DELETE CASCADE,
+            agent_id TEXT NOT NULL REFERENCES agents(id),
+            epoch INTEGER NOT NULL CHECK (epoch > 0),
+            token TEXT NOT NULL UNIQUE,
+            mailbox_owner TEXT NOT NULL,
+            submitted_at INTEGER NOT NULL,
+            observed_at INTEGER
+        ) STRICT;
+        CREATE INDEX mailbox_pi_handoffs_pending_idx ON mailbox_pi_handoffs(agent_id, epoch)
+        WHERE observed_at IS NULL;
 
         CREATE TABLE mailbox_idempotency_tombstones (
             sender_scope TEXT NOT NULL,

@@ -4,13 +4,14 @@ import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import type {
     AgentEndEvent,
+    ContextEvent,
     ExtensionAPI,
     ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import { type OrchestratorConfig, resolveConfig } from "../config.ts";
 import type { AgentRecord, AgentStatus } from "../domain/agent.ts";
 import { ValidationError } from "../domain/errors.ts";
-import { type AgentId, parseAgentId, parseThreadId } from "../domain/ids.ts";
+import { type AgentId, parseAgentId, parseMessageId, parseThreadId } from "../domain/ids.ts";
 import type { MailboxMessage, MessageKind, MessageState } from "../domain/mailbox.ts";
 import { type JsonValue, validateAlias } from "../domain/validation.ts";
 import type { Failpoint } from "../faults.ts";
@@ -269,6 +270,20 @@ export class PiHerdrRuntime {
         active.completion?.abort();
     }
 
+    onContext(event: ContextEvent, ctx: ExtensionContext): void {
+        const active = this.#requireActive();
+        if (ctx.sessionManager.getSessionId() !== active.identity.sessionId)
+            throw new ValidationError("Context belongs to another Pi session");
+        for (const message of event.messages) {
+            if (message.role !== "custom" || message.customType !== "pi-herdr-mail") continue;
+            const details = jsonObject(message.details as JsonValue);
+            if (typeof details.messageId !== "string" || typeof details.handoffToken !== "string")
+                continue;
+            if (details.executionEpoch !== active.store.execution?.epoch) continue;
+            active.store.observePiHandoff(parseMessageId(details.messageId), details.handoffToken);
+        }
+    }
+
     async onAgentSettled(ctx: ExtensionContext): Promise<void> {
         const active = this.#active;
         if (!active?.child) return;
@@ -448,7 +463,8 @@ export class PiHerdrRuntime {
         const id = parseMessageIdForTool(messageId);
         const before = active.store.getMessage(id);
         this.#assertRecipient(before, active.identity.id);
-        if (before.state === "queued") await active.pump.pollMessage(id);
+        if (before.state === "queued" || before.state === "delivered")
+            await active.pump.pollMessage(id);
         if (this.#requireProtocolMutation() !== active) {
             throw new ValidationError("Pi session changed while reading mail");
         }

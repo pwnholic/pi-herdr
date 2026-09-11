@@ -9,8 +9,8 @@ import { parseAgentId, parseMessageId } from "../domain/ids.ts";
 import {
     assertJsonValue,
     type JsonValue,
-    validateLabel,
     MAX_MESSAGE_BYTES,
+    validateLabel,
 } from "../domain/validation.ts";
 import type { StorageDatabase } from "./database.ts";
 import { canonicalJson, parseStoredJson } from "./json.ts";

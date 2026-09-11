@@ -24,7 +24,7 @@ A gap belongs here only when it can affect:
 | Priority | Gap                                                                                                                  | Severity               | Status                        |
 | -------- | -------------------------------------------------------------------------------------------------------------------- | ---------------------- | ----------------------------- |
 | P0       | `agent_settled` is too close to being treated as a global quiescence barrier                                         | **CRITICAL candidate** | Partially hardened; handoff remains open |
-| P0       | SQLite mailbox state and native Pi steering/follow-up queues lack an explicit fenced handoff                         | **CRITICAL candidate** | Architectural                 |
+| P0       | SQLite mailbox state and native Pi steering/follow-up queues need an end-to-end fenced handoff                       | **CRITICAL candidate** | Durable context gate implemented; provider boundary/uncertain injection open |
 | P0       | Completion must freeze protocol mutations and invalidate drafts across model turns, not only agent runs             | **CRITICAL candidate** | Local guards and store ownership fencing implemented; Pi handoff open |
 | P0       | Durable execution epoch and exclusive binding                                                                       | **HIGH**               | Implemented for managed store connections; real-process tests pass |
 | P1       | Pi session replacement through `/new`, `/resume`, `/fork`, and `/clone` needs an explicit UI lifecycle policy         | **HIGH**               | Binding replacement rejected; command interception open |
@@ -117,10 +117,50 @@ Evidence and limits:
   a SQLite epoch alone. Wall-clock changes may affect lease availability; epoch
   equality still rejects an old owner after takeover, even with its clock behind.
 
+### Pi context-observation checkpoint (after pushed `af282ea`)
+
+- Added a single-baseline `mailbox_pi_handoffs` ledger: message, recipient, execution
+  epoch, random token, mailbox owner, submission time, and context-observation time.
+  Current baseline is `pi-herdr-control-plane-v1-handoffs`; `v1-executions` is now
+  rejected too. No existing user database was migrated or deleted.
+- Dispatcher journals before injection. Queue submission is `pending`, not `read`.
+  Pump retains/renews pending leases and reconciles observations without reinjection.
+  Ordinary/steering delivery no longer treats session-history presence as consumption.
+- The Pi `context` hook records only matching token/current-epoch observations with
+  live recipient mailbox ownership. Tracked unobserved handoffs fence read/ack and
+  completion in storage; beginning a new handoff invalidates an unpublished draft.
+- Tests cover queued-but-unobserved mail, wrong tokens, expired mailbox ownership,
+  replacement epochs, pending lease renewal, late optional mail, and preservation of
+  observed handoff identity after injected failure. A real Pi agent loop with an
+  offline model stream verifies follow-up queue ordering; its ExtensionAPI adapter
+  is mocked. This is not full AgentSession/Herdr acceptance.
+- Repeated pump shutdown now waits for the same in-flight dispatch before resource
+  release; restoring the old early return reproduces the failing regression.
+- Unobserved handoffs from an earlier epoch of the same run also block completion
+  until recovered, rather than disappearing from the barrier during replacement.
+- Final `bun run check`: all 148 tests, typecheck, formatting, and lint passed;
+  `git diff --check` passed. No skipped tests. Dependencies were not upgraded.
+- Exact dependency source was read alongside the official Pi extension docs:
+  `context` runs before a model call, but later extensions can still transform it.
+  The pinned `0.85.0` SDK barrel/direct session import also pulls an unavailable
+  `@earendil-works/pi-server` dependency in this installation. The real agent-loop
+  test avoids that import; package integration is not claimed fixed.
+
+Remaining handoff work:
+
+- Context observation is weaker than provider-request inclusion or processing.
+  Another extension can strip/change a message after our hook; that boundary is open.
+- Pi's void `sendMessage` adapter hides asynchronous injection errors. An unobserved
+  handoff stays pending, blocks completion, and is not silently reinjected in the
+  same execution. Queue loss needs explicit runtime restart and mailbox lease
+  recovery today; automatic uncertainty resolution and health diagnostics remain open.
+- Parent result notification still uses its existing effect journal/history replay;
+  it is not covered by the ordinary/steering context gate.
+
 Next implementation slice:
 
-1. Delivery-attempt identity and Pi consumption evidence, including custom messages,
-   lease loss, reload, crash, and asynchronous injection failure.
+1. Extend the context gate to provider-boundary evidence and explicit uncertain
+   injection recovery, including reload, crash, queue loss, and asynchronous failure.
 2. Completion barrier incorporating that evidence and broader fail-closed runtime health.
 3. Real Pi/Herdr acceptance for correction, session replacement, and reload.
 

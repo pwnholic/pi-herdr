@@ -34,6 +34,7 @@ import {
     ExecutionRepository,
 } from "./executions.ts";
 import { canonicalJson } from "./json.ts";
+import { HandoffRepository } from "./handoffs.ts";
 import {
     type ClaimMessagesInput,
     type DeadLetterMessageInput,
@@ -97,6 +98,7 @@ export class SqliteControlPlaneStore {
     readonly #workflows: WorkflowRepository;
     readonly #events: EventRepository;
     readonly #executions: ExecutionRepository;
+    readonly #handoffs: HandoffRepository;
 
     private constructor(options: OpenStoreOptions) {
         this.#database = new StorageDatabase(options);
@@ -106,6 +108,7 @@ export class SqliteControlPlaneStore {
         this.#workflows = new WorkflowRepository(this.#database);
         this.#events = new EventRepository(this.#database);
         this.#executions = new ExecutionRepository(this.#database);
+        this.#handoffs = new HandoffRepository(this.#database);
     }
 
     static open(options: OpenStoreOptions): SqliteControlPlaneStore {
@@ -134,6 +137,24 @@ export class SqliteControlPlaneStore {
 
     assertExecution(): void {
         this.#database.connection.transaction(() => this.#executions.assertCurrent()).immediate();
+    }
+
+    beginPiHandoff(messageId: MessageId, mailboxOwner: string) {
+        return this.#write(() =>
+            this.#handoffs.begin(messageId, mailboxOwner, this.#requireExecution()),
+        );
+    }
+
+    observePiHandoff(messageId: MessageId, token: string): boolean {
+        return this.#write(() =>
+            this.#handoffs.observe(messageId, token, this.#requireExecution()),
+        );
+    }
+
+    #requireExecution(): ExecutionLease {
+        const execution = this.#executions.lease;
+        if (!execution) throw new ValidationError("Pi handoff requires a bound execution");
+        return execution;
     }
 
     #write<T>(operation: () => T): T {
@@ -244,11 +265,17 @@ export class SqliteControlPlaneStore {
     }
 
     markMessageRead(input: MessageMutationInput): MailboxMessage {
-        return this.#write(() => this.#mailbox.markRead(input));
+        return this.#write(() => {
+            if (this.execution) this.#handoffs.assertObserved(input.messageId, this.execution);
+            return this.#mailbox.markRead(input);
+        });
     }
 
     acknowledgeMessage(input: MessageMutationInput): MailboxMessage {
-        return this.#write(() => this.#mailbox.acknowledge(input));
+        return this.#write(() => {
+            if (this.execution) this.#handoffs.assertObserved(input.messageId, this.execution);
+            return this.#mailbox.acknowledge(input);
+        });
     }
 
     renewMessageLease(input: RenewMessageLeaseInput): MailboxMessage {
@@ -291,12 +318,16 @@ export class SqliteControlPlaneStore {
     }
 
     declareCompletion(input: DeclareCompletionInput): CompletionOutboxRecord {
-        return this.#write(() => this.#completions.declare(input));
+        return this.#write(() => {
+            if (this.execution) this.#handoffs.assertSettled(this.execution);
+            return this.#completions.declare(input);
+        });
     }
 
     /** Frozen declaration, mailbox envelope, and publication marker commit together. */
     publishCompletion(agentId: AgentId, runId: string, token: string): MailboxMessage {
         return this.#write(() => {
+            if (this.execution) this.#handoffs.assertSettled(this.execution);
             const agent = this.#agents.get(agentId);
             const declaration = this.#completions.get(agentId);
             if (

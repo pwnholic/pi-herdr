@@ -117,6 +117,103 @@ test("read messages renew their lease before another mailbox claim", async () =>
     assert.equal(current.revision, 3);
 });
 
+test("repeated stop waits for the same in-flight dispatch before releasing resources", async () => {
+    const gate = Promise.withResolvers<"read">();
+    let claimed = false;
+    const pump = new MailboxPump({
+        recipientAgentId: AGENT_ID,
+        owner: "test-owner",
+        leaseMs: 1000,
+        pollMs: 1000,
+        batchSize: 1,
+        dispatch: () => gate.promise,
+        store: {
+            getMessage: () => message(),
+            claimMessages: () => {
+                if (claimed) return [];
+                claimed = true;
+                return [message()];
+            },
+            markMessageRead: () => ({ ...message(2), state: "read" }),
+            acknowledgeMessage: () => message(),
+            renewMessageLease: () => message(),
+            retryMessage: () => message(),
+        },
+    });
+    const polling = pump.pollNow();
+    let firstDone = false,
+        secondDone = false;
+    const first = pump.stop().then(() => {
+        firstDone = true;
+    });
+    const second = pump.stop().then(() => {
+        secondDone = true;
+    });
+    try {
+        await Promise.resolve();
+        assert.equal(firstDone, false);
+        assert.equal(secondDone, false);
+    } finally {
+        gate.resolve("read");
+        await Promise.all([polling, first, second]);
+    }
+});
+
+test("pending Pi context observations keep delivery leased without marking it read", async () => {
+    let now = 0;
+    let current = { ...message(), leaseExpiresAt: 1000 };
+    let claimed = false;
+    let observed = false;
+    let reads = 0;
+    const pump = new MailboxPump({
+        recipientAgentId: AGENT_ID,
+        owner: "test-owner",
+        leaseMs: 1000,
+        pollMs: 100,
+        batchSize: 1,
+        now: () => now,
+        dispatch: async () => (observed ? "read" : "pending"),
+        store: {
+            getMessage: () => current,
+            claimMessages: () => {
+                if (claimed) return [];
+                claimed = true;
+                return [current];
+            },
+            markMessageRead: (input) => {
+                assert.equal(input.expectedRevision, current.revision);
+                reads++;
+                current = { ...current, state: "read", revision: current.revision + 1 };
+                return current;
+            },
+            acknowledgeMessage: () => {
+                throw new Error("must not auto-ack");
+            },
+            renewMessageLease: (input) => {
+                current = {
+                    ...current,
+                    leaseExpiresAt: now + input.leaseMs,
+                    revision: current.revision + 1,
+                };
+                return current;
+            },
+            retryMessage: () => {
+                throw new Error("pending is not a delivery failure");
+            },
+        },
+    });
+    await pump.pollNow();
+    now = 900;
+    await pump.pollNow();
+    assert.equal(current.state, "delivered");
+    assert.equal(current.leaseExpiresAt, 1900);
+    assert.equal(reads, 0);
+    observed = true;
+    await pump.pollNow();
+    assert.equal(reads, 1);
+    assert.equal(current.state, "read");
+});
+
 test("renews the active delivery lease while an external dispatch is slow", async () => {
     let current = { ...message(), leaseExpiresAt: Date.now() + 30 };
     let claimed = false;

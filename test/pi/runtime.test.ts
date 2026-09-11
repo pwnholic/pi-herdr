@@ -3,8 +3,15 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, test } from "node:test";
+import { Agent } from "@earendil-works/pi-agent-core";
+import {
+    type AssistantMessage,
+    createAssistantMessageEventStream,
+    type Model,
+} from "@earendil-works/pi-ai";
 import type {
     AgentEndEvent,
+    ContextEvent,
     ExtensionAPI,
     ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
@@ -24,7 +31,7 @@ afterEach(() => {
     }
 });
 
-function fixture() {
+function fixture(autoObserve = true) {
     const directory = mkdtempSync(join(tmpdir(), "pi-herdr-runtime-"));
     temporaryDirectories.push(directory);
     const filename = join(directory, "control.sqlite");
@@ -47,12 +54,14 @@ function fixture() {
     const sent: Array<{ message: unknown; options: unknown }> = [];
     const entries: unknown[] = [];
     const names: string[] = [];
+    let observeRuntime: PiHerdrRuntime;
     const pi = {
         setSessionName: (name: string) => names.push(name),
         getSessionName: () => undefined,
         sendMessage: (message: unknown, options: unknown) => {
             sent.push({ message, options });
             entries.push({ type: "custom_message", ...(message as object) });
+            if (autoObserve) observeRuntime.onContext(contextEvent(message), context);
         },
     } as unknown as ExtensionAPI;
     const context = {
@@ -78,6 +87,7 @@ function fixture() {
             PI_HERDR_COMPLETION_POLL_MS: "60000",
         },
     });
+    observeRuntime = runtime;
     return {
         directory,
         filename,
@@ -90,8 +100,134 @@ function fixture() {
         sent,
         names,
         entries,
+        observeWith: (replacement: PiHerdrRuntime) => {
+            observeRuntime = replacement;
+        },
     };
 }
+
+function contextEvent(message: unknown): ContextEvent {
+    return {
+        type: "context",
+        messages: [{ role: "custom", ...(message as object) }],
+    } as ContextEvent;
+}
+
+test("real Pi agent-loop follow-up queue stays unread until its next context", async () => {
+    const f = fixture(false);
+    const firstStarted = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const model: Model<"anthropic-messages"> = {
+        id: "fixture",
+        name: "Offline fixture",
+        api: "anthropic-messages",
+        provider: "anthropic",
+        baseUrl: "https://example.invalid",
+        reasoning: false,
+        input: ["text"],
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+        contextWindow: 4096,
+        maxTokens: 128,
+    };
+    let calls = 0;
+    const agent = new Agent({
+        initialState: { model },
+        transformContext: async (messages) => {
+            f.runtime.onContext({ type: "context", messages }, f.context);
+            return messages;
+        },
+        streamFn: async () => {
+            if (++calls === 1) {
+                firstStarted.resolve();
+                await release.promise;
+            }
+            const stream = createAssistantMessageEventStream();
+            const message: AssistantMessage = {
+                role: "assistant",
+                content: [{ type: "text", text: "done" }],
+                api: model.api,
+                provider: model.provider,
+                model: model.id,
+                usage: {
+                    input: 0,
+                    output: 0,
+                    cacheRead: 0,
+                    cacheWrite: 0,
+                    totalTokens: 0,
+                    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+                },
+                stopReason: "stop",
+                timestamp: Date.now(),
+            };
+            stream.push({ type: "done", reason: "stop", message });
+            return stream;
+        },
+    });
+    // AgentSession's streaming custom follow-up route uses this real agent queue.
+    // The ExtensionAPI adapter is mocked; no provider/network is used.
+    f.pi.sendMessage = (message) => {
+        agent.followUp({ role: "custom", ...message, timestamp: Date.now() });
+    };
+    let running: Promise<void> | undefined;
+    try {
+        await f.runtime.start(f.context);
+        running = agent.prompt("hold first turn");
+        await firstStarted.promise;
+        const mail = f.setupStore.enqueueMessage({
+            senderAgentId: f.parent.id,
+            recipientAgentId: f.child.id,
+            kind: "message",
+            content: "follow-up evidence",
+        }).message;
+        await assert.rejects(f.runtime.readMail(mail.id), /not currently readable/);
+        assert.equal(agent.hasQueuedMessages(), true);
+        assert.equal(f.setupStore.getMessage(mail.id).state, "delivered");
+        release.resolve();
+        await running;
+        assert.equal(calls, 2);
+        assert.equal((await f.runtime.readMail(mail.id)).state, "read");
+    } finally {
+        release.resolve();
+        await running;
+        await f.runtime.stop();
+        f.setupStore.close();
+    }
+});
+
+test("queued custom mail is not read or acknowledged until its exact handoff appears in context", async () => {
+    const f = fixture(false);
+    try {
+        await f.runtime.start(f.context);
+        const message = f.setupStore.enqueueMessage({
+            senderAgentId: f.parent.id,
+            recipientAgentId: f.child.id,
+            kind: "message",
+            content: "delayed follow-up",
+        }).message;
+        await assert.rejects(f.runtime.readMail(message.id), /not currently readable/);
+        assert.equal(f.setupStore.getMessage(message.id).state, "delivered");
+        await assert.rejects(f.runtime.acknowledgeMail(message.id), /must be read/);
+        assert.throws(
+            () =>
+                f.runtime.declareCompletion({ status: "succeeded", summary: "too early" }, "early"),
+            /handoff/,
+        );
+        assert.equal(f.sent.length, 1); // polling while queued must not duplicate injection
+        const sent = f.sent[0]!.message as { details: Record<string, unknown> };
+        f.runtime.onContext(
+            contextEvent({ ...sent, details: { ...sent.details, handoffToken: "wrong" } }),
+            f.context,
+        );
+        await assert.rejects(f.runtime.readMail(message.id), /not currently readable/);
+        f.runtime.onContext(contextEvent(sent), f.context);
+        assert.equal((await f.runtime.readMail(message.id)).state, "read");
+        assert.equal((await f.runtime.acknowledgeMail(message.id)).state, "acked");
+        assert.equal(f.sent.length, 1);
+    } finally {
+        await f.runtime.stop();
+        f.setupStore.close();
+    }
+});
 
 function assistantEvent(stopReason: "stop" | "aborted", text = "final answer"): AgentEndEvent {
     return {
@@ -851,7 +987,8 @@ test("tools support discover, direct request, read, reply, ack and sender receip
     const peerRuntime = new PiHerdrRuntime(
         {
             setSessionName: () => undefined,
-            sendMessage: () => undefined,
+            sendMessage: (message: unknown) =>
+                peerRuntime.onContext(contextEvent(message), base.context),
         } as unknown as ExtensionAPI,
         {
             extensionPath: join(base.directory, "extension.ts"),
@@ -930,7 +1067,7 @@ test("tools support discover, direct request, read, reply, ack and sender receip
     }
 });
 
-test("recovery detects a Pi-persisted injection after failure and does not duplicate it", async () => {
+test("recovery retains observed handoff evidence after injection failure without duplicating it", async () => {
     const base = fixture();
     const failpoints = new DeterministicFailpoints([{ point: "mailbox.injection.after" }]);
     const runtime = new PiHerdrRuntime(base.pi, {
@@ -943,6 +1080,7 @@ test("recovery detects a Pi-persisted injection after failure and does not dupli
         },
         failpoint: failpoints.hit,
     });
+    base.observeWith(runtime);
     const queued = base.setupStore.enqueueMessage({
         senderAgentId: base.parent.id,
         recipientAgentId: base.child.id,

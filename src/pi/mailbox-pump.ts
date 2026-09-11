@@ -3,7 +3,7 @@ import type { AgentId, MessageId } from "../domain/ids.ts";
 import type { MailboxMessage } from "../domain/mailbox.ts";
 import type { SqliteControlPlaneStore } from "../storage/index.ts";
 
-export type MailboxDisposition = "read" | "ack";
+export type MailboxDisposition = "read" | "ack" | "pending";
 
 export interface MailboxPumpStore {
     getMessage(
@@ -72,6 +72,7 @@ export class MailboxPump {
     #timer: NodeJS.Timeout | undefined;
     #inFlight: Promise<void> | undefined;
     readonly #readLeases = new Set<MessageId>();
+    readonly #pendingLeases = new Set<MessageId>();
     #stopped = true;
     #lastPruneAt: number | undefined;
     #laneIndex = 0;
@@ -103,12 +104,12 @@ export class MailboxPump {
     }
 
     async stop(): Promise<void> {
-        if (this.#stopped) return;
         this.#stopped = true;
         if (this.#timer !== undefined) clearTimeout(this.#timer);
         this.#timer = undefined;
         await this.#inFlight;
         this.#readLeases.clear();
+        this.#pendingLeases.clear();
     }
 
     async pollNow(): Promise<void> {
@@ -141,6 +142,17 @@ export class MailboxPump {
     }
 
     async #poll(messageId?: MessageId): Promise<void> {
+        for (const pendingId of this.#pendingLeases) {
+            if (messageId !== undefined && pendingId !== messageId) continue;
+            const pending = this.#store.getMessage(pendingId);
+            if (pending.state !== "delivered" || pending.leaseOwner !== this.owner) {
+                this.#pendingLeases.delete(pendingId);
+                continue;
+            }
+            // Reconcile context observation without enqueuing another Pi message.
+            // eslint-disable-next-line no-await-in-loop
+            await this.#deliver(pending);
+        }
         this.#renewReadLeases();
         this.#pruneIfDue();
         const maximum = messageId === undefined ? this.#batchSize : 1;
@@ -193,6 +205,12 @@ export class MailboxPump {
         try {
             const disposition = await this.#dispatch(message);
             if (heartbeatError !== undefined) throw heartbeatError;
+            if (disposition === "pending") {
+                this.#pendingLeases.add(latest.id);
+                this.#readLeases.add(latest.id);
+                return true;
+            }
+            this.#pendingLeases.delete(latest.id);
             latest = this.#store.markMessageRead({
                 messageId: latest.id,
                 recipientAgentId: this.#recipientAgentId,
@@ -242,7 +260,7 @@ export class MailboxPump {
         for (const messageId of this.#readLeases) {
             const current = this.#store.getMessage(messageId);
             if (
-                current.state !== "read" ||
+                (current.state !== "read" && current.state !== "delivered") ||
                 current.leaseOwner !== this.owner ||
                 current.leaseExpiresAt === undefined ||
                 current.leaseExpiresAt <= now

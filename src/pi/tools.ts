@@ -438,6 +438,7 @@ export function registerPiHerdrTools(
         promptSnippet: "Read incoming mail; follow nextOffset before processing.",
         promptGuidelines: [
             "Use agent_mail_read on an inbox message ID, read all needed chunks via nextOffset, then handle its work before agent_mail_ack; if FIFO or lease ownership blocks the read, inspect earlier inbox messages instead of bypassing ownership.",
+            "For agent_mail_read, a delivered message may still be waiting in Pi's steering/follow-up queue. It becomes readable after its matching handoff is observed in model context. Let the queued turn run; do not repeatedly retry or acknowledge it early.",
         ],
         parameters: Type.Object(
             {

@@ -33,6 +33,7 @@ export function registerPiHerdrExtension(
     pi.on("session_shutdown", async (_event, _ctx) => runtime.stop());
     pi.on("agent_start", (_event, _ctx) => runtime.onAgentStart());
     pi.on("turn_start", (_event, _ctx) => runtime.onTurnStart());
+    pi.on("context", (event, ctx) => runtime.onContext(event, ctx));
     pi.on("agent_end", (event, _ctx) => runtime.onAgentEnd(event));
     pi.on("agent_settled", async (_event, ctx) => runtime.onAgentSettled(ctx));
     return runtime;

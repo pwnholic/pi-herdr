@@ -124,14 +124,30 @@ export async function dispatchMailboxMessage(
     if (message.recipientAgentId !== identity) {
         throw new ValidationError("Mailbox dispatcher received a message for another agent");
     }
-    if (options.hasPiMailboxMessage(message.id)) return "read";
+    if (!message.leaseOwner) throw new ValidationError("Pi handoff requires a mailbox lease owner");
+    const handoff = active.store.beginPiHandoff(message.id, message.leaseOwner);
+    if (handoff.observed) return "read";
+    if (!handoff.created) return "pending";
     options.failpoint?.("mailbox.injection.before", { messageId: message.id });
-    options.pi.sendMessage(mailboxCustomMessage(message), {
-        triggerTurn: true,
-        deliverAs: message.deliveryMode,
-    });
+    const custom = mailboxCustomMessage(message);
+    options.pi.sendMessage(
+        {
+            ...custom,
+            details: {
+                ...custom.details,
+                handoffToken: handoff.token,
+                executionEpoch: handoff.epoch,
+            },
+        },
+        {
+            triggerTurn: true,
+            deliverAs: message.deliveryMode,
+        },
+    );
     options.failpoint?.("mailbox.injection.after", { messageId: message.id });
-    return "read";
+    return active.store.beginPiHandoff(message.id, message.leaseOwner).observed
+        ? "read"
+        : "pending";
 }
 
 function jsonObject(value: JsonValue): Readonly<Record<string, JsonValue>> {

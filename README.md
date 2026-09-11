@@ -65,8 +65,8 @@ require a managed Herdr environment.
 
 This rewrite intentionally has one schema baseline, not a chain of compatibility migrations.
 Older development databases, including earlier variants of schema version 1, fail with
-`MIGRATION_FAILED`. The current baseline is `pi-herdr-control-plane-v1-executions`;
-the preceding `pi-herdr-control-plane-v1-runs` baseline is also incompatible.
+`MIGRATION_FAILED`. The current baseline is `pi-herdr-control-plane-v1-handoffs`;
+the preceding `v1-runs` and `v1-executions` baselines are also incompatible.
 
 Use a fresh `PI_HERDR_DB` path, or archive the old development database while all users of it are
 stopped. The extension never deletes an existing database automatically. All workers launched by
@@ -159,6 +159,20 @@ turn invalidates an unpublished declaration.
 Settlement reported while Pi is busy or reports pending messages also invalidates the draft.
 Public send/read/ack/retry operations are frozen while a completion draft is declared.
 Managed workers reject a Pi session ID different from their existing registry binding.
+
+Ordinary mail and steering instructions have a durable Pi handoff token bound to the recipient's
+execution epoch and mailbox owner. Submission alone leaves mail `delivered`. Only the matching
+custom message observed by this extension's `context` hook permits `read`, then explicit ack.
+Polling maintains the lease without reinjecting the same handoff. A new handoff invalidates a
+completion draft, and unobserved handoffs block declaration/publication, including optional mail.
+Rename controls and parent-side result application remain direct protocol effects.
+
+Context observation is not proof of provider receipt or model understanding: another extension
+may still transform context afterward. If Pi drops a custom queue or asynchronously fails to
+inject it, the handoff remains pending rather than becoming falsely read. Let queued turns run;
+if no context observation can occur, restart that runtime, then allow mailbox lease recovery.
+Replacement epochs get new handoff tokens; old tokens cannot confirm the replacement delivery.
+Automatic recovery from uncertain injection and full provider-boundary fencing remain open.
 
 Each managed parent or worker binds its store connection to a durable execution identity:
 agent ID, run ID, Pi session ID, monotonic epoch, and unique process owner. A live lease prevents
